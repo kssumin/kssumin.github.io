@@ -2,6 +2,7 @@ import { unified } from 'unified';
 import remarkParse from 'remark-parse';
 import remarkGfm from 'remark-gfm';
 import remarkRehype from 'remark-rehype';
+import rehypeSlug from 'rehype-slug';
 import rehypePrettyCode from 'rehype-pretty-code';
 import rehypeReact from 'rehype-react';
 import * as prod from 'react/jsx-runtime';
@@ -25,6 +26,7 @@ export async function MarkdownRenderer({ content }: { content: string }) {
     .use(remarkGfm)
     .use(remarkRewritePostLinks)
     .use(remarkRehype)
+    .use(rehypeSlug)
     .use(rehypePrettyCode, { theme: 'github-light' })
     .use(rehypeReact, {
       Fragment: prod.Fragment,
