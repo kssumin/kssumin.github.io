@@ -1,4 +1,5 @@
 import Link from 'next/link';
+import { notFound } from 'next/navigation';
 import { getAllPosts, getAllTags, getPostsByTag } from '@/lib/posts';
 import { PostRow } from '@/components/PostRow';
 
@@ -10,7 +11,11 @@ export function generateStaticParams() {
 export default async function TagPage({ params }: { params: Promise<{ tag: string }> }) {
   const { tag } = await params;
   const posts = getAllPosts();
-  const matched = getPostsByTag(posts, tag);
+  const matched = getPostsByTag(posts, tag).sort((a, b) =>
+    a.date > b.date ? -1 : a.date < b.date ? 1 : 0
+  );
+
+  if (matched.length === 0) notFound();
 
   return (
     <main>
@@ -22,7 +27,7 @@ export default async function TagPage({ params }: { params: Promise<{ tag: strin
 
       <div>
         {matched.map((post) => (
-          <PostRow key={post.slug} post={post} />
+          <PostRow key={post.slug} post={post} showEpisode={false} />
         ))}
       </div>
     </main>

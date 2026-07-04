@@ -1,8 +1,8 @@
 import Link from 'next/link';
 import type { PostMeta } from '@/lib/posts';
 
-export function PostRow({ post }: { post: PostMeta }) {
-  const episode = post.series ? `EP.${String(post.order).padStart(2, '0')}` : null;
+export function PostRow({ post, showEpisode = true }: { post: PostMeta; showEpisode?: boolean }) {
+  const episode = showEpisode && post.series ? `EP.${String(post.order).padStart(2, '0')}` : null;
 
   return (
     <Link
