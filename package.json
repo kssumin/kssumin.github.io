@@ -7,6 +7,8 @@
     "build": "next build",
     "start": "next start",
     "test": "vitest run",
+    "sync-content": "bash scripts/sync-content.sh",
+    "predeploy": "npm run sync-content",
     "deploy": "NEXT_PUBLIC_ENVIRONMENT=PRODUCTION next build && touch out/.nojekyll && npx gh-pages -d out --dotfiles"
   },
   "dependencies": {
