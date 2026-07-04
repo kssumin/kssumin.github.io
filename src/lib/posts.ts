@@ -12,6 +12,7 @@ export interface PostMeta {
   order: number;
   date: string;
   tags: string[];
+  draft: boolean;
 }
 
 export interface Post extends PostMeta {
@@ -45,6 +46,7 @@ function readPostFile(filename: string): Post {
     order: data.order ?? 0,
     date: data.date,
     tags: data.tags ?? [],
+    draft: data.draft ?? false,
     content: bodyWithoutLeadingH1,
   };
 }
@@ -127,4 +129,8 @@ export function getAllTags(posts: PostMeta[]): string[] {
 
 export function getPostsByTag(posts: PostMeta[], tag: string): PostMeta[] {
   return posts.filter((p) => p.tags.includes(tag));
+}
+
+export function getPublishedPosts(posts: PostMeta[]): PostMeta[] {
+  return posts.filter((p) => !p.draft);
 }

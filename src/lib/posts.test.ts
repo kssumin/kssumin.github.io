@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { groupPostsBySeries, getAdjacentPosts, getAllTags, getPostsByTag, type PostMeta } from './posts';
+import {
+  groupPostsBySeries,
+  getAdjacentPosts,
+  getAllTags,
+  getPostsByTag,
+  getPublishedPosts,
+  type PostMeta,
+} from './posts';
 
 const post = (overrides: Partial<PostMeta>): PostMeta => ({
   slug: 'slug',
@@ -9,6 +16,7 @@ const post = (overrides: Partial<PostMeta>): PostMeta => ({
   order: 0,
   date: '2026-01-01',
   tags: [],
+  draft: false,
   ...overrides,
 });
 
@@ -88,5 +96,25 @@ describe('tags', () => {
 
   it('존재하지 않는 태그는 빈 배열을 반환한다', () => {
     expect(getPostsByTag(posts, 'Kotlin')).toEqual([]);
+  });
+});
+
+describe('getPublishedPosts', () => {
+  it('draft: true인 글은 제외한다', () => {
+    const posts = [
+      post({ slug: 'a', draft: true }),
+      post({ slug: 'b', draft: false }),
+    ];
+    expect(getPublishedPosts(posts).map((p) => p.slug)).toEqual(['b']);
+  });
+
+  it('draft: false인 글은 유지한다', () => {
+    const posts = [post({ slug: 'a', draft: false })];
+    expect(getPublishedPosts(posts).map((p) => p.slug)).toEqual(['a']);
+  });
+
+  it('draft 필드가 기본값(false)인 글은 유지한다', () => {
+    const posts = [post({ slug: 'a' })];
+    expect(getPublishedPosts(posts).map((p) => p.slug)).toEqual(['a']);
   });
 });

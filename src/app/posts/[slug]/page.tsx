@@ -1,11 +1,11 @@
 import Link from 'next/link';
 import { notFound } from 'next/navigation';
-import { getAllPosts, getAllSlugs, getPostBySlug, getAdjacentPosts } from '@/lib/posts';
+import { getAllPosts, getPostBySlug, getAdjacentPosts, getPublishedPosts } from '@/lib/posts';
 import { MarkdownRenderer } from '@/components/MarkdownRenderer';
 import { TagChip } from '@/components/TagChip';
 
 export function generateStaticParams() {
-  return getAllSlugs().map((slug) => ({ slug }));
+  return getPublishedPosts(getAllPosts()).map((post) => ({ slug: post.slug }));
 }
 
 export default async function PostPage({ params }: { params: Promise<{ slug: string }> }) {
@@ -18,7 +18,7 @@ export default async function PostPage({ params }: { params: Promise<{ slug: str
     notFound();
   }
 
-  const allPosts = getAllPosts();
+  const allPosts = getPublishedPosts(getAllPosts());
   const { prev, next } = getAdjacentPosts(slug, allPosts);
 
   return (

@@ -1,16 +1,16 @@
 import Link from 'next/link';
 import { notFound } from 'next/navigation';
-import { getAllPosts, getAllTags, getPostsByTag } from '@/lib/posts';
+import { getAllPosts, getAllTags, getPostsByTag, getPublishedPosts } from '@/lib/posts';
 import { PostRow } from '@/components/PostRow';
 
 export function generateStaticParams() {
-  const posts = getAllPosts();
+  const posts = getPublishedPosts(getAllPosts());
   return getAllTags(posts).map((tag) => ({ tag }));
 }
 
 export default async function TagPage({ params }: { params: Promise<{ tag: string }> }) {
   const { tag } = await params;
-  const posts = getAllPosts();
+  const posts = getPublishedPosts(getAllPosts());
   const matched = getPostsByTag(posts, tag).sort((a, b) =>
     a.date > b.date ? -1 : a.date < b.date ? 1 : 0
   );

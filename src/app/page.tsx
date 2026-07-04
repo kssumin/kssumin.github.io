@@ -1,9 +1,9 @@
-import { getAllPosts, groupPostsBySeries } from '@/lib/posts';
+import { getAllPosts, getPublishedPosts, groupPostsBySeries } from '@/lib/posts';
 import { SeriesHeader } from '@/components/SeriesHeader';
 import { PostRow } from '@/components/PostRow';
 
 export default function HomePage() {
-  const posts = getAllPosts();
+  const posts = getPublishedPosts(getAllPosts());
   const groups = groupPostsBySeries(posts);
 
   return (
