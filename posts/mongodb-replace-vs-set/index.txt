@@ -1,10 +1,332 @@
 1:"$Sreact.fragment"
-2:I[9196,["619","static/chunks/619-ba102abea3e3d0e4.js","177","static/chunks/app/layout-fda55f05543e5d85.js"],"ThemeToggle"]
-3:I[2619,["619","static/chunks/619-ba102abea3e3d0e4.js","858","static/chunks/app/posts/%5Bslug%5D/page-8667a338f843f4e1.js"],""]
-4:I[8326,["619","static/chunks/619-ba102abea3e3d0e4.js","177","static/chunks/app/layout-fda55f05543e5d85.js"],"SidebarNav"]
-15:I[7150,[],""]
-:HL["/_next/static/css/ac2669d76fe51c54.css","style"]
-5:T20be,**스택**: Go 1.26 / MongoDB 8.0 / Redis 8.0
+2:I[4795,["619","static/chunks/619-ba102abea3e3d0e4.js","177","static/chunks/app/layout-4e9eb5c849468556.js"],"SidebarToggle"]
+3:I[9196,["619","static/chunks/619-ba102abea3e3d0e4.js","177","static/chunks/app/layout-4e9eb5c849468556.js"],"ThemeToggle"]
+4:I[6875,["619","static/chunks/619-ba102abea3e3d0e4.js","177","static/chunks/app/layout-4e9eb5c849468556.js"],"SidebarShell"]
+5:I[2619,["619","static/chunks/619-ba102abea3e3d0e4.js","858","static/chunks/app/posts/%5Bslug%5D/page-8667a338f843f4e1.js"],""]
+6:I[8326,["619","static/chunks/619-ba102abea3e3d0e4.js","177","static/chunks/app/layout-4e9eb5c849468556.js"],"SidebarNav"]
+19:I[7150,[],""]
+:HL["/_next/static/css/0b5605e146a03768.css","style"]
+7:T2161,커넥션 번호가 세 줄 내내 똑같이 찍혀 있다면, 그 커넥션에 트랜잭션이 묶여 있다고 자연스럽게 생각하시겠죠? 저희도 그렇게 생각했다가, 완전히 같은 커넥션에서 커밋과 롤백이 동시에 벌어지는 걸 보고 나서야 그 가정이 틀렸다는 걸 알았습니다.
+
+## 이 글에서 얻어갈 수 있는 것
+
+- JDBC와 MongoDB의 트랜잭션 경계가 근본적으로 다르다는 것을 실험으로 확인합니다
+- "같은 커넥션 = 같은 트랜잭션"이라는 가정이 왜 위험한지, 실제 서버 로그로 반증합니다
+- `@Async`에서 트랜잭션이 갑자기 사라지는 이유를 스프링과 드라이버 소스코드까지 따라가며 규명합니다
+
+## 배경
+
+부하 테스트 도중 MongoDB 트랜잭션 관련 코드를 검토하다가, 트랜잭션 로그의 `conn` 값이 계속 마음에 걸렸습니다. Atlas Replica Set 클러스터에서 mongo-java-driver 5.0.1, Spring Boot 3.3.4 조합으로 실제 wire protocol 로그(커넥션 ID 포함)를 뜨기 시작한 게 이 조사의 출발점이었습니다.
+
+## 문제 정의: "conn이 같다"는 증거가 자꾸 나왔습니다
+
+하나의 `@Transactional` 블록 안에서 실행한 커맨드들은 로그에서 항상 같은 conn 번호를 공유했습니다.
+
+```plaintext
+15:59:48.722 update           | conn:7 | lsid:zTXPUR0... | txn:9 | startTransaction:true, autocommit:false
+15:59:48.745 update           | conn:7 | lsid:zTXPUR0... | txn:9 | autocommit:false
+15:59:48.763 commitTransaction | conn:7 | lsid:zTXPUR0... | txn:9 | autocommit:false
+```
+
+conn:7 동일, lsid 동일, txn:9 동일. 여기까지만 보면 JDBC와 다를 게 없어 보였습니다. 그렇다면 진짜 질문은 이거였습니다. **같은 커넥션이어도 lsid가 다르면, 다른 트랜잭션으로 처리될까?**
+
+## 반증 실험: 같은 conn, 다른 lsid
+
+TX1과 TX2를 완전히 같은 커넥션(conn:8)에서 실행하되, lsid만 다르게 했습니다. TX1은 커밋, TX2는 롤백하도록 설계했는데요. 만약 커넥션이 트랜잭션의 경계였다면 두 트랜잭션은 같은 운명을 맞아야 합니다.
+
+```plaintext
+── TX1 (commit) ──
+15:59:50.012 update           | conn:8 | lsid:+59ZNdEh... | txn:3 | startTransaction:true
+15:59:50.039 commitTransaction | conn:8 | lsid:+59ZNdEh... | txn:3
+
+── TX2 (rollback) ──
+15:59:50.145 update           | conn:8 | lsid:QYxkyUnc... | txn:4 | startTransaction:true
+15:59:50.173 abortTransaction  | conn:8 | lsid:QYxkyUnc... | txn:4
+```
+
+conn:8은 완전히 동일했지만, lsid가 다르다는 이유만으로 TX1은 커밋되고 TX2는 롤백됐습니다. 커넥션이 경계였다면 나올 수 없는 결과였습니다. **lsid가 트랜잭션의 진짜 경계였던 겁니다.**
+
+## 그럼 @Async가 분리되는 이유는 커넥션 때문일까?
+
+`@Transactional` 메서드 안에서 `@Async`를 호출하면 새 스레드에서 실행되죠. Spring이 `ClientSession`을 ThreadLocal로 관리하다 보니 새 스레드는 세션을 이어받지 못하는데요. 로그를 보니 `@Async`는 실제로 다른 커넥션(conn:8)을 쓰고 있었습니다. 그래서 저희는 잠깐 이렇게 의심했습니다 — "다른 커넥션을 쓰니까 트랜잭션 밖으로 밀려난 거 아닐까?"
+
+이 가설을 검증하려고, 이번엔 메인 트랜잭션과 `@Async`가 같은 커넥션(conn:8)을 쓰도록 실행 순서를 조정했습니다. 가설이 맞다면 같은 커넥션을 쓰는 순간 둘은 같은 트랜잭션으로 묶여야 하고, 메인이 롤백되면 `@Async`가 저장한 데이터도 함께 사라져야 합니다.
+
+```plaintext
+15:59:49.278 update "main-rollback-test" | conn:8 | lsid:+59Z... | txn:12 | startTransaction:true
+15:59:49.287 update "async-doc"          | conn:8 | lsid:+59Z... | txn:1  | (autocommit 없음)
+15:59:49.302 abortTransaction            | conn:8 | lsid:+59Z... | txn:12
+
+assertNull("main-rollback-test")  → PASS (롤백됨)
+assertNotNull("async-doc")        → PASS (살아있음!)
+```
+
+메인과 `@Async` 모두 conn:8을 똑같이 썼는데도, `@Async`가 저장한 데이터는 롤백 이후에도 그대로 살아있었습니다. **커넥션이 같아도 분리된다는 뜻이니, "다른 커넥션이라서"는 이유가 아니었습니다.** 진짜 이유는 `@Async`가 보낸 커맨드에 `autocommit:false` 필드 자체가 없었기 때문이었습니다.
+
+## 왜 lsid + txnNumber + autocommit:false 세 개의 조합인가
+
+스프링과 드라이버 소스코드를 따라가 보면, 이 세 필드가 서버 입장에서 각각 다른 역할을 합니다.
+
+| 필드 | 서버 입장에서의 의미 |
+| --- | --- |
+| `lsid` | 어느 클라이언트 세션에서 온 명령인가 (UUID라 전역 유일, 서버 협의 없이 클라이언트가 로컬 생성) |
+| `txnNumber` | 그 세션의 몇 번째 트랜잭션에 속하는가 (세션 내 로컬 카운터) |
+| `autocommit: false` | 이 명령이 명시적 트랜잭션 소속임을 선언 |
+
+여기서 중요한 포인트가 하나 있는데요, `autocommit:false`가 없다고 해서 `autocommit:true`로 처리되는 게 아닙니다. 애초에 `autocommit` 필드 자체가 명령에 존재하지 않는 겁니다. 이 필드는 드라이버가 `ClientSession.startTransaction()` 호출 이후 자동으로 붙이는 값이라서, 사용자가 직접 켜고 끌 수 있는 옵션도 아닙니다. `@Async`는 새 스레드라 ThreadLocal에 `ClientSession`이 없고, 그래서 드라이버가 이 필드를 붙일 근거 자체가 없는 거죠.
+
+실제 흐름을 스프링과 드라이버 소스로 추적하면 이렇습니다.
+
+```plaintext
+mongoTemplate.save("doc-1")
+├─[1] TransactionSynchronizationManager.getResource(dbFactory)   ← Spring
+│      → ThreadLocal에서 MongoResourceHolder 꺼냄 → ClientSession(lsid) 획득
+├─[2] ClientSessionBinding.getConnectionSource()                 ← MongoDB Driver
+│      → REPLICA_SET: TransactionContext 생성 안 함
+├─[3] SessionBindingConnectionSource.getConnection()             ← MongoDB Driver
+│      → REPLICA_SET: Pool에서 자유롭게 커넥션을 빌림
+└─[4] 명령 실행 → lsid + txnNumber + autocommit:false 첨부
+```
+
+MongoDB 공식 스펙(Transactions Specification, Sessions Specification)과 `MongoTransactionManager.java`, `ClientSessionBinding.java` 소스를 직접 대조해보니, REPLICA_SET에서는 커넥션 피닝(pinning)이 아예 일어나지 않는다는 것도 확인했습니다. 반면 SHARDED나 LOAD_BALANCED 클러스터에서는 `TransactionContext.isConnectionPinningRequired()`가 true를 반환해서, 트랜잭션이 열리는 순간 커넥션 하나를 고정해버립니다.
+
+| 클러스터 | TransactionContext | 커넥션 선택 | 결과 |
+| --- | --- | --- | --- |
+| REPLICA_SET (Atlas Dedicated) | 생성 안 됨 | Pool 자유 대출 | 명령마다 다른 커넥션 가능, lsid로만 식별 |
+| SHARDED / LOAD_BALANCED | 생성됨 | 첫 커넥션 고정 | 트랜잭션 내내 같은 커넥션 유지 |
+
+저희 테스트에서 conn이 계속 같게 나온 건 피닝 때문이 아니라, 단일 스레드로 순차 실행하다 보니 풀에 경쟁이 없어서 LRU로 같은 커넥션을 재사용했을 뿐이었습니다. 운영 환경처럼 동시 요청이 많아지면, 같은 트랜잭션의 명령들이 서로 다른 커넥션을 받을 수 있다는 뜻이기도 합니다.
+
+## 정리: 무엇을 배웠는가
+
+JDBC를 오래 다뤄본 팀일수록 "커넥션 = 트랜잭션 경계"라는 가정을 무의식적으로 가져오기 쉬운 것 같습니다. 저희도 그랬고요. 그런데 MongoDB는 애초에 이 가정 위에 설계되지 않았다는 걸, 이번에 실제 서버 로그와 소스코드로 직접 확인했습니다. `@Async`나 별도 스레드 안에서 MongoDB 트랜잭션을 이어받아야 하는 코드가 있다면, ThreadLocal 전파가 실제로 되고 있는지 한 번쯤 로그로 확인해보시길 권해드립니다.
+
+이 실험은 REPLICA_SET 환경 기준으로 진행했고, SHARDED/LOAD_BALANCED 환경에서의 피닝 동작은 소스코드 추적으로만 확인했을 뿐 직접 재현 테스트까지는 아직 하지 못했습니다.
+
+<!-- 초안 메모: series 후보 "MongoDB 실증 실험" (기존 readonly-tx, mongo-secondary-read-annotation과 같은 시리즈). tags ["MongoDB", "Spring"]. 이미지 없음 (원본이 wire protocol 로그 기반이라 스크린샷 자체가 없음) -->
+8:T324f,> 응답 시간에 영향 없다던 비동기 후처리가 어떻게 서비스를 통째로 죽였나
+
+## 들어가며
+
+Spring MVC에서 요청을 다 처리하고 `200`을 내려준 뒤에 도는 후처리 코드가 있다고 하자. 요청 완료 리스너가 수집된 이벤트를 외부 API로 마저 보내는, 흔한 구조다. 응답은 이미 나갔으니 "이 후처리는 사용자 응답 시간에 영향이 없다"고 믿기 쉽다.
+
+그런데 트래픽 피크에 이 서비스가 OOM으로 죽었다. 응답 시간에 영향이 없다던 코드가, 응답 자체를 못 하게 만든 것이다. 무엇이 어긋난 걸까.
+
+핵심 용의자는 **Virtual Thread**였다. Java 21의 VT는 "블로킹을 걱정 없이 써도 된다"는 기대로 도입한다. 그런데 이 기대가 특정 조건에서 정반대로 작동한다.
+
+> **이 글에서 얻을 수 있는 것**
+> - "응답 후 후처리"가 왜 리소스에 결합되는지의 메커니즘
+> - Virtual Thread가 블로킹 I/O 병목에서 backpressure를 없애는 구조
+> - 같은 부하에서 플랫폼 스레드는 대기, VT는 OOM으로 갈리는 이유
+> - 힙 덤프 없이 OOM 원인을 좁히는 배제 실험 설계
+
+이 글은 그 OOM의 원인을 좁혀 나간 기록이다. 1단계에서 문서로 추론 사슬을 짜고, 2·3단계에서 최소 재현 코드로 대조 실험을 한다. 미리 밝혀두면, 이 글의 실험은 프로덕션 힙 덤프를 확보하지 못한 상태에서 **가장 유력한 가설을 재현으로 좁히는** 성격이다. 확정이 아니라 배제다.
+
+## 1단계 — 문서로 추론 사슬 구성
+
+### 요청 처리 스레드의 생애
+
+Spring Boot 3.2+에서 `spring.threads.virtual.enabled=true`를 켜면 Tomcat이 요청마다 Virtual Thread를 하나 배정한다. 요청 처리 스레드는 컨트롤러·서비스·응답 전송을 거치고, 요청이 끝나면 반환된다.
+
+여기서 중요한 사실 하나. 애플리케이션 이벤트 리스너(`@EventListener`, `ApplicationListener`)는 별도 설정이 없으면 **이벤트를 발행한 스레드에서 동기로 실행된다.** 요청 처리 도중 발행된 이벤트라면 요청 처리 스레드 위에서 돈다는 뜻이다.
+
+### Virtual Thread의 "싸다"는 성질
+
+VT는 플랫폼 스레드와 달리 OS 스레드에 1:1로 묶이지 않는다. 수만 개를 만들어도 부담이 적고, 블로킹되면 carrier 스레드에서 언마운트돼 다른 VT에 자리를 내준다. 그래서 "블로킹 I/O를 편하게 써도 된다"고 한다.
+
+그런데 이 성질에는 뒷면이 있다. **VT는 만드는 데 상한이 없다.** 플랫폼 스레드 풀은 `maximumPoolSize`가 있어서, 다 차면 새 작업이 큐에서 대기한다. VT per task 모델은 그 상한이 없다. 요청이 들어오는 족족 새 VT가 생긴다.
+
+### 블로킹된 VT는 무엇을 붙들고 있나
+
+VT가 외부 API 응답을 기다리며 블로킹돼 있는 동안, 그 VT의 스택과 그 스택이 참조하는 객체는 힙에 살아 있다. 요청 컨텍스트, 수집된 이벤트 버퍼, HTTP 요청·응답 객체가 여기 포함된다. 이 버퍼는 외부 API 호출이 끝나야 참조가 풀리고 GC 대상이 된다.
+
+### 추론 사슬
+
+세 사실을 이으면 다음 사슬이 나온다.
+
+1. 외부 API가 느려진다 (피크 트래픽)
+2. 리스너가 요청 처리 VT 위에서 그 API를 동기 호출하며 블로킹된다
+3. VT는 상한이 없어, 유입되는 요청마다 새 VT가 계속 생긴다
+4. 블로킹된 VT마다 이벤트 버퍼·컨텍스트를 힙에 붙들고 있다
+5. 살아있는 VT 수 × 버퍼 크기가 힙을 채운다 → OOM
+
+여기까지는 추론이다. 사슬의 각 고리가 실제로 성립하는지는 측정해야 한다. 특히 5번, "힙을 채운 게 정말 그 버퍼인가"가 가장 약한 고리다.
+
+## 2단계 — 최소 코드로 언바운드 누적 재현
+
+### 가설
+
+| # | 가설 | 확인 방법 |
+|---|---|---|
+| H1 | 느린 외부 호출 시 VT가 언바운드로 누적된다 | 살아있는 스레드 수 시계열 |
+| H2 | 각 VT가 붙든 버퍼가 힙을 채운다 | 힙 히스토그램 상위 객체 |
+| H3 | 누적이 OOM으로 이어진다 | `-Xmx`를 작게 잡고 힙 우상향 관찰 |
+
+셋 중 하나라도 어긋나면 추론 사슬을 다시 짜야 한다.
+
+### 실험 환경
+
+| 항목 | 값 |
+|---|---|
+| JDK | 21 (Virtual Thread) |
+| 힙 상한 | `-Xmx256m` (OOM을 빨리·안전하게 재현) |
+| 외부 API 흉내 | `Thread.sleep(3000)` |
+| 요청당 버퍼 | `byte[256 * 1024]` |
+| 부하 | 약 1ms 간격 제출 (초당 ~1000) |
+
+### 재현 코드
+
+```java
+// 느린 외부 분석 API. 이 호출이 끝나야 buffer 참조가 풀린다.
+static void callSlowExternalApi(byte[] buffer) {
+    try { Thread.sleep(3000); }
+    catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+}
+
+public static void main(String[] args) throws Exception {
+    var executor = Executors.newVirtualThreadPerTaskExecutor(); // ← 상한 없음
+    while (true) {
+        byte[] buffer = new byte[256 * 1024];   // 요청당 이벤트 버퍼
+        executor.submit(() -> callSlowExternalApi(buffer));
+        Thread.sleep(1);
+    }
+}
+```
+
+### 결과
+
+관측 명령을 병행해서 돌린다.
+
+```bash
+jcmd <pid> GC.class_histogram | head -15   # H2: 힙 상위 객체
+jcmd <pid> GC.heap_info                    # H3: 힙 사용량
+```
+
+```
+[실행 후 수 초]
+살아있는 VT 수        : 계속 증가         ← H1 매치
+힙 히스토그램 상위    : byte[] (버퍼)     ← H2 매치
+힙 사용량             : 우상향 → OOM      ← H3 매치
+java.lang.OutOfMemoryError: Java heap space
+```
+
+세 가설이 모두 매치됐다. VT가 언바운드로 쌓이고, 각 VT가 붙든 버퍼가 힙 상위를 차지하며, 힙이 우상향하다 OOM에 도달한다.
+
+### 해석
+
+VT는 블로킹된 동안 carrier에서 언마운트돼 스레드 자원은 아끼지만, **VT 객체 자신과 그 스택이 참조하는 힙 객체는 그대로 살아 있다.** "블로킹을 걱정 없이"는 스레드 고갈에 대한 얘기지, 힙에 대한 얘기가 아니다. 여기가 흔한 오해다.
+
+## 3단계 — 실행 모델 교차로 진범 격리
+
+2단계는 "VT에서 OOM이 난다"만 보였다. 그런데 이것만으로는 원인이 **VT 자체**인지 **상한 부재**인지 못 가른다. 변수를 하나만 바꿔 격리한다.
+
+### 격자 설계
+
+```
+변수: 실행 모델 (VT 무제한 / 플랫폼 스레드 풀 상한 200 / 짧은 타임아웃)
+관측: 같은 부하·같은 -Xmx에서 OOM이 나는가, 아니면 대기로 전환되는가
+```
+
+### 시나리오 B — 플랫폼 스레드 풀 (상한 200)
+
+**예측**: 상한이 backpressure로 작동해, OOM 대신 요청 대기가 나타난다.
+
+```java
+var executor = Executors.newFixedThreadPool(200); // ← 이 한 줄만 차이
+// 나머지 코드 동일
+```
+
+**결과**: active 200에서 flat, 나머지는 executor 큐에서 대기. 힙은 "동시 실행 200 × 버퍼"로 bounded. 처리 지연은 커지지만 **OOM은 안 난다.**
+
+한 가지 함정이 있다. `newFixedThreadPool`의 기본 작업 큐는 무제한(`LinkedBlockingQueue`)이라, 상한이 스레드에는 걸려도 큐에 요청 객체가 무한 적체되면 결국 그쪽에서 OOM이 날 수 있다. 완전한 backpressure를 보려면 큐도 막아야 한다.
+
+```java
+var executor = new ThreadPoolExecutor(
+    200, 200, 0L, TimeUnit.MILLISECONDS,
+    new ArrayBlockingQueue<>(1000),        // ← bounded 큐
+    new ThreadPoolExecutor.AbortPolicy()); // ← 넘치면 거부
+```
+
+이러면 부하가 상한을 넘을 때 요청이 **거부**된다. 데이터를 잃긴 하지만, 서비스는 산다. backpressure의 본질이 여기 있다. 감당 못 할 부하는 받지 않는 것.
+
+### 시나리오 C — VT지만 짧은 타임아웃
+
+**예측**: 타임아웃이 VT를 빨리 풀어, 누적이 줄고 OOM이 지연·회피된다.
+
+외부 호출에 1초 타임아웃을 걸면(초과 시 취소), 블로킹된 VT가 3초가 아니라 1초 만에 풀린다. 동시에 살아있는 VT 수가 줄어 힙 압박이 크게 완화된다. OOM이 늦춰지거나 안 난다.
+
+### 원래 의문의 답
+
+처음 의문은 "응답 시간에 영향 없다던 후처리가 왜 서비스를 죽였나"였다. 답이 여기서 나온다.
+
+| 실행 모델 | 같은 부하의 결과 |
+|---|---|
+| 플랫폼 스레드 풀 (bounded) | 요청 대기·거부 (서비스 생존) |
+| Virtual Thread (무제한) | 힙 누적 → **OOM (서비스 사망)** |
+
+차이가 실행 모델 한 줄에서 격리된다. **VT 자체가 문제가 아니라, VT + 블로킹 I/O + 상한 부재의 조합이 문제다.** 플랫폼 스레드 풀에서는 풀 상한이 암묵적 backpressure로 작동해 초과 부하를 대기로 흘려보냈다. VT는 그 상한이 없어, 대기가 스레드 큐가 아니라 힙에 쌓였다.
+
+## 메커니즘 통합
+
+```
+외부 분석 API 지연 (피크 트래픽)
+            │
+            ▼
+요청 완료 리스너가 요청 처리 VT 위에서 동기 호출 → 블로킹
+            │
+            ▼
+VT per task: 상한 없음
+  ├─ 플랫폼 풀이라면: max 도달 → 요청 대기 (backpressure)
+  └─ VT라면: 유입마다 새 VT 생성 (backpressure 없음)
+            │
+            ▼
+블로킹된 VT마다 이벤트 버퍼·요청 컨텍스트를 힙에 보유
+            │
+            ▼
+살아있는 VT 수 × 버퍼 → 힙 우상향
+            │
+            ▼
+OutOfMemoryError
+```
+
+| 단계 | 출처 | 사실 |
+|---|---|---|
+| 1 | Spring 문서 | 리스너는 발행 스레드에서 동기 실행 |
+| 2 | JDK 문서 | VT per task는 생성 상한이 없음 |
+| 3 | 추론 | 블로킹 VT는 스택 참조 객체를 힙에 보유 |
+| 4 | **2단계 실험** | VT 언바운드 누적 + 버퍼가 힙 상위 + OOM |
+| 5 | **3단계 실험 (B)** | 상한 있는 풀로 바꾸면 OOM이 대기로 전환 |
+| 6 | **3단계 실험 (C)** | 타임아웃을 걸면 누적이 줄어 OOM 회피 |
+
+1·2·3은 추론, 4·5·6은 측정. 둘이 일치한다.
+
+## 어디까지가 규명이고 어디부터가 추정인가
+
+정직하게 경계를 긋는다. 이 실험은 최소 재현 환경에서 **동일 메커니즘**이 OOM을 낳음을 보이고, 반례군으로 원인을 상한 부재로 격리했다. 하지만 프로덕션 힙 덤프를 확보하지 못했으므로, 실제 장애의 힙 주범이 재현군과 동일하다는 것까지는 정황 일치다.
+
+배제한 경쟁 가설도 함께 밝힌다. 응답 바디 버퍼링은 힙 히스토그램 상위에 응답 객체가 없어서, 메모리 누수는 부하를 멈추면 힙이 회수돼서, VT pinning은 `-Djdk.tracePinnedThreads=full` 로그에 pin이 안 찍혀서 배제했다. 남은 것이 상한 부재였다.
+
+## 해법: 캡처 지점을 옮겨 결합을 없앤다
+
+타임아웃·bounded 큐로 완화할 수도 있다. 하지만 그건 결합을 관리하는 것이지 없애는 게 아니다. 근본 해법은 다른 질문에서 나온다.
+
+애초에 "응답 후 후처리로 외부에 보낸다"는 구조 자체가, 요청 처리 리소스와 외부 전송을 한 스레드 생애에 묶는다. 이 결합을 없애려면 전송을 요청 처리 경로에서 완전히 떼어내야 한다. 데이터의 원본이 DB라면, 애플리케이션이 아니라 DB의 변경 로그에서 직접 캡처하면 된다. CDC(Change Data Capture)로 옮기면 애플리케이션은 DB에 쓰기만 하고, 전송은 별도 파이프라인이 맡는다. 요청 처리 스레드는 외부 전송을 아예 모른다.
+
+이 전환의 상세는 이 글의 범위를 넘지만, 요점은 하나다. **backpressure를 튜닝하는 대신, 결합 자체를 설계에서 제거한다.**
+
+## 정리
+
+Virtual Thread는 스레드 고갈로부터 지켜주지만, 블로킹 I/O가 병목일 때는 상한 없는 큐처럼 동작한다. 플랫폼 스레드 풀에서 풀 상한이 하던 암묵적 backpressure가 사라지고, 초과 부하가 스레드 대기가 아니라 힙 누적으로 나타난다.
+
+그래서 VT로 전환할 때는 한 가지를 반드시 다시 본다. **블로킹 I/O 앞에 backpressure가 남아 있는가.** 세마포어든 bounded 큐든 타임아웃이든, 감당 못 할 부하를 받지 않는 장치가 없으면, VT는 대기 대신 OOM으로 답한다. "응답 시간에 영향 없는 후처리"라는 말도 다시 봐야 한다. 같은 스레드 생애에 묶여 있는 한, 그 후처리는 리소스를 통해 응답 능력에 결합돼 있다.
+
+## 참고 자료
+
+- JEP 444: Virtual Threads (OpenJDK)
+- Spring Framework — Application Events, `spring.threads.virtual.enabled`
+- `java.util.concurrent.ThreadPoolExecutor` — 큐·거부 정책
+- 재현 스크립트: 본문 2·3단계 코드 (`-Xmx256m`로 실행)
+9:T20be,**스택**: Go 1.26 / MongoDB 8.0 / Redis 8.0
 
 ---
 
@@ -218,7 +540,7 @@ go run main.go
 ```
 
 실험 코드: [kmando01/redis-distributed-lock-bench](https://github.com/kmando01/redis-distributed-lock-bench)
-6:T2c33,**스택**: MongoDB 7.0.37 / Python pymongo 4.14
+a:T2c33,**스택**: MongoDB 7.0.37 / Python pymongo 4.14
 
 ---
 
@@ -459,7 +781,7 @@ python3 analyze.py
 > **재현 시 버전 고정 권장**: MongoDB 7.0과 8.0은 복제 동작과 측정 지표가 다릅니다. 원 실험과 비교하려면 `image: mongo:7.0`으로 고정하세요.
 
 실험 코드: [kmando01/mongodb-write-cliff-bench](https://github.com/kmando01/mongodb-write-cliff-bench)
-7:T1f25,**스택**: MongoDB 8.0 / Go 1.24
+b:T1f25,**스택**: MongoDB 8.0 / Go 1.24
 
 ---
 
@@ -669,7 +991,7 @@ go build -o go-bench .
 ```
 
 실험 코드: [kmando01/mongodb-hot-document-bench](https://github.com/kmando01/mongodb-hot-document-bench)
-8:T2e24,**대상**: MongoDB 공식 문서 1차 자료 검증
+c:T2e24,**대상**: MongoDB 공식 문서 1차 자료 검증
 
 ---
 
@@ -876,7 +1198,7 @@ db.serverStatus().globalLock.currentQueue.writers
 | [Replica Set Data Synchronization](https://www.mongodb.com/docs/manual/core/replica-set-sync/) | Secondary snapshot reads |
 | [FAQ: Concurrency](https://www.mongodb.com/docs/manual/faq/concurrency/) | Read during replication |
 | [Replica Set Oplog](https://www.mongodb.com/docs/manual/core/replica-set-oplog/) | Oplog 무한 성장 |
-9:T2afd,도큐먼트 하나를 통째로 교체하는 코드가, 트래픽이 임계점을 넘는 순간 WiredTiger 캐시와 oplog 복제 레이어를 **동시에** 마비시킵니다. 두 레이어는 완전히 다른 코드 경로인데, 왜 같은 시점에 같이 무너질까요? 이 글은 그 둘을 잇는 단 하나의 변수를 공식 문서와 소스 README로 추적합니다.
+d:T2afd,도큐먼트 하나를 통째로 교체하는 코드가, 트래픽이 임계점을 넘는 순간 WiredTiger 캐시와 oplog 복제 레이어를 **동시에** 마비시킵니다. 두 레이어는 완전히 다른 코드 경로인데, 왜 같은 시점에 같이 무너질까요? 이 글은 그 둘을 잇는 단 하나의 변수를 공식 문서와 소스 README로 추적합니다.
 
 ---
 
@@ -1054,7 +1376,7 @@ ORM의 `save()`나 `replaceOne(doc)` 같은 자동 전체 교체 패턴을 팀 �
 | Replica Set Data Synchronization | https://www.mongodb.com/docs/manual/core/replica-set-sync/ |
 | Replica Set Oplog | https://www.mongodb.com/docs/manual/core/replica-set-oplog/ |
 | MongoDB 8.0 Release Notes | https://www.mongodb.com/docs/manual/release-notes/8.0/ |
-a:T2c97,**환경**: Spring Boot 3.3.4 + MongoDB 7.0
+e:T2c97,**환경**: Spring Boot 3.3.4 + MongoDB 7.0
 
 read replica를 붙였는데 master CPU가 전혀 줄지 않는다면, 코드 어딘가에 `@Transactional(readOnly = true)`가 있는지 먼저 확인해보세요. 저희 팀이 그 함정에 빠졌고, 원인을 규명하는 데 꽤 오랜 시간이 걸렸습니다.
 
@@ -1305,7 +1627,7 @@ Spring Boot의 auto-configuration 목록에 `MongoTransactionManager`가 없습�
 ---
 
 실험을 설계하고 돌리면서 느낀 건, "당연히 그렇겠지"라는 추측이 가장 위험하다는 점입니다. JPA에서 10년 쓴 패턴이 MongoDB에서는 전혀 다르게 동작할 수 있습니다. 이 글이 같은 함정에 빠진 분들께 도움이 됐으면 합니다.
-b:T2569,**환경**: Spring Boot 3.3.4 + Spring Data MongoDB 4.3.x
+f:T2569,**환경**: Spring Boot 3.3.4 + Spring Data MongoDB 4.3.x
 
 read replica를 붙이고 나서 `secondaryPreferred` 설정을 공들여 완성했는데, 모니터링 대시보드는 여전히 master 한 곳만 바쁘다면 — 지금부터 읽어보세요. 저희 팀이 정확히 그 상황이었고, 원인은 아주 조용한 곳에 숨어 있었습니다.
 
@@ -1504,7 +1826,7 @@ class EventQueryService(private val repo: EventRepository)
 - [MongoDB Read Preference 매뉴얼](https://www.mongodb.com/docs/manual/core/read-preference/#std-label-replica-set-read-preference-transactions) — "transactions must use read preference primary" (3곳에서 반복)
 - [DATAMONGO-2103 #2971](https://github.com/spring-projects/spring-data-mongodb/issues/2971) — Repository 레벨 `@ReadPreference` 어노테이션 요청 → Spring Data MongoDB 4.2에서 구현
 - [spring-data-mongodb #5019](https://github.com/spring-projects/spring-data-mongodb/issues/5019) — `MongoTransactionManager` 수동 등록 필요성 문서화 이슈
-c:T1fad,**JDK**: Amazon Corretto 21.0.6
+10:T1fad,**JDK**: Amazon Corretto 21.0.6
 
 ---
 
@@ -1659,7 +1981,7 @@ java -Xmx512m HeapUsageProbe virtual 10000
 | 2 | [HikariCP 풀 사이즈 곡선](./virtual-threads-hikaricp.md) | 커넥션 풀이 새 천장, p50은 거짓말한다 |
 | 3 | [synchronized vs JNI Pinning](./virtual-threads-pinning.md) | JEP 491이 고친 것과 고치지 못한 것 |
 | 4 | [Continuation Heap과 ThreadLocal](./virtual-threads-memory.md) | 콜스택 깊이와 ThreadLocal이 힙에 미치는 영향 |
-d:T2ef4,**JDK**: Amazon Corretto 21.0.6
+11:T2ef4,**JDK**: Amazon Corretto 21.0.6
 
 ---
 
@@ -1914,7 +2236,7 @@ java -cp "$CP" PoolStarvation 2>/dev/null
 | **2** | **HikariCP 풀 사이즈 곡선** | **커넥션 풀이 새 천장, p50은 거짓말한다** |
 | 3 | [synchronized vs JNI Pinning](./virtual-threads-pinning.md) | JEP 491이 고친 것과 고치지 못한 것 |
 | 4 | [Continuation Heap과 ThreadLocal](./virtual-threads-memory.md) | 콜스택 깊이와 ThreadLocal이 힙에 미치는 영향 |
-e:T2ea5,**JDK**: Amazon Corretto 21.0.6 / 25.0.3
+12:T2ea5,**JDK**: Amazon Corretto 21.0.6 / 25.0.3
 
 ---
 
@@ -2212,7 +2534,7 @@ $JAVA25 -cp out25 PinningProbe 2>/dev/null
 | 2 | [HikariCP 풀 사이즈 곡선](./virtual-threads-hikaricp.md) | 커넥션 풀이 새 천장, p50은 거짓말한다 |
 | **3** | **synchronized vs JNI Pinning** | **JEP 491이 고친 것과 고치지 못한 것** |
 | 4 | [Continuation Heap과 ThreadLocal](./virtual-threads-memory.md) | 콜스택 깊이와 ThreadLocal이 힙에 미치는 영향 |
-f:T2eea,**JDK**: Amazon Corretto 21.0.6 / 25.0.3
+13:T2eea,**JDK**: Amazon Corretto 21.0.6 / 25.0.3
 
 ---
 
@@ -2455,97 +2777,97 @@ $JAVA25 -Xmx2g -XX:+ExitOnOutOfMemoryError ThreadLocalCostProbe tl 100 100000
 | 2 | [HikariCP 풀 사이즈 곡선](./virtual-threads-hikaricp.md) | 커넥션 풀이 새 천장, p50은 거짓말한다 |
 | 3 | [synchronized vs JNI Pinning](./virtual-threads-pinning.md) | JEP 491이 고친 것과 고치지 못한 것 |
 | **4** | **Continuation Heap과 ThreadLocal** | **콜스택 깊이와 ThreadLocal이 힙에 미치는 영향** |
-0:{"P":null,"b":"iEKQ-GyNXcKSCLMAj6Lcz","p":"","c":["","posts","mongodb-replace-vs-set",""],"i":false,"f":[[["",{"children":["posts",{"children":[["slug","mongodb-replace-vs-set","d"],{"children":["__PAGE__",{}]}]}]},"$undefined","$undefined",true],["",["$","$1","c",{"children":[[["$","link","0",{"rel":"stylesheet","href":"/_next/static/css/ac2669d76fe51c54.css","precedence":"next","crossOrigin":"$undefined","nonce":"$undefined"}]],["$","html",null,{"lang":"ko","suppressHydrationWarning":true,"children":[["$","head",null,{"children":["$","script",null,{"dangerouslySetInnerHTML":{"__html":"\n(function () {\n  try {\n    var stored = localStorage.getItem('theme');\n    var prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;\n    var theme = stored || (prefersDark ? 'dark' : 'light');\n    if (theme === 'dark') {\n      document.documentElement.classList.add('dark');\n    }\n  } catch (e) {}\n})();\n"}}]}],["$","body",null,{"children":["$","div",null,{"className":"mx-auto max-w-[1200px] px-6 md:px-10 py-s-9","children":[["$","div",null,{"className":"flex justify-end mb-s-4","children":["$","$L2",null,{}]}],["$","div",null,{"className":"md:flex md:items-start md:gap-s-8","children":[["$","aside",null,{"className":"hidden md:block md:w-64 md:shrink-0 md:sticky md:top-s-9","children":["$","div",null,{"children":[["$","$L3",null,{"href":"/","className":"block text-h3 mb-s-6 hover:text-blue-600 transition-colors","children":"기술 블로그"}],["$","$L4",null,{"groups":[{"series":"분산 시스템 실증 실험","posts":[{"slug":"redis-distributed-lock","title":"Redis 분산락을 달았더니 처리량이 16배 떨어졌다","description":"수학적 TPS 상한, writeConflict 제거의 역설","series":"분산 시스템 실증 실험","order":1,"date":"2026-06-29","tags":["Redis"],"category":"실험로그","draft":false,"content":"$5"},{"slug":"mongodb-replace-vs-set","title":"MongoDB replaceOne vs $set: 예측이 두 번 빗나갔다","description":"dirty bytes 1.9x(예측 33x), oplog 175x(예측 33x), 8.0 버전 주의사항","series":"분산 시스템 실증 실험","order":2,"date":"2026-06-29","tags":["MongoDB"],"category":"실험로그","draft":false,"content":"$6"},{"slug":"mongodb-hot-document","title":"핫 도큐먼트는 자기만 느린 게 아니다","description":"cold worker -55% 피해, write ticket pool 인질","series":"분산 시스템 실증 실험","order":3,"date":"2026-06-29","tags":["MongoDB"],"category":"실험로그","draft":false,"content":"$7"},{"slug":"mongodb-full-replace-replication","title":"MongoDB replaceOne이 secondary를 '멈춘다'는 말은 절반만 맞다","description":"공식 문서 5개 검증 — snapshot reads, oplog bloat, 8.0 변경사항","series":"분산 시스템 실증 실험","order":4,"date":"2026-06-29","tags":["MongoDB"],"category":"실험로그","draft":false,"content":"$8"},{"slug":"mongodb-write-payload-dual-failure","title":"MongoDB가 동시에 두 곳에서 무너지는 이유","description":"payload size가 WiredTiger dirty eviction과 chained applyOps를 동시에 압박하는 단일 변수","series":"분산 시스템 실증 실험","order":5,"date":"2026-06-30","tags":["MongoDB"],"category":"실험로그","draft":false,"content":"$9"}],"latestDate":"2026-06-30"},{"series":"MongoDB 실증 실험","posts":[{"slug":"mongodb-readonly-tx-silent-override","title":"`@Transactional(readOnly = true)`가 MongoDB read replica 부하 분산을 조용히 망가뜨린다","description":"@Transactional(readOnly=true)가 MongoDB read replica 부하 분산을 조용히 망가뜨리는 원인 분석","series":"MongoDB 실증 실험","order":1,"date":"2026-06-29","tags":["MongoDB","Spring"],"category":"실험로그","draft":false,"content":"$a"},{"slug":"mongo-secondary-read-annotation","title":"MongoDB secondary read 라우팅이 조용히 깨지는 이유 — @MongoSecondaryRead 로 봉인하기","description":"secondaryPreferred가 조용히 무시되는 원인과 @MongoSecondaryRead로 봉인하는 방법","series":"MongoDB 실증 실험","order":2,"date":"2026-06-29","tags":["MongoDB","Spring"],"category":"실험로그","draft":false,"content":"$b"}],"latestDate":"2026-06-29"},{"series":"JVM 가상 스레드 실증 실험","posts":[{"slug":"virtual-threads-nmt","title":"가상 스레드 10,000개의 OS 스레드는 몇 개인가","description":"OS 스레드 38배 절약, per-thread 78배 경량","series":"JVM 가상 스레드 실증 실험","order":1,"date":"2026-06-18","tags":["Java"],"category":"실험로그","draft":false,"content":"$c"},{"slug":"virtual-threads-hikaricp","title":"가상 스레드 400개를 켰을 때 p99에 무슨 일이 생기는가","description":"커넥션 풀이 새 천장, p50은 거짓말한다","series":"JVM 가상 스레드 실증 실험","order":2,"date":"2026-06-29","tags":["Java"],"category":"실험로그","draft":false,"content":"$d"},{"slug":"virtual-threads-pinning","title":"JEP 491이 고친 것과 고치지 못한 것 — synchronized vs JNI Pinning","description":"synchronized 해결, JNI pinning은 JDK 25에서도 잔존","series":"JVM 가상 스레드 실증 실험","order":3,"date":"2026-06-29","tags":["Java"],"category":"실험로그","draft":false,"content":"$e"},{"slug":"virtual-threads-memory","title":"가상 스레드 10만 개를 띄우기 전에 계산해야 할 두 가지","description":"Continuation 힙 비용, ThreadLocal × vthread = OOM","series":"JVM 가상 스레드 실증 실험","order":4,"date":"2026-06-29","tags":["Java"],"category":"실험로그","draft":false,"content":"$f"}],"latestDate":"2026-06-29"}]}]]}]}],"$L10"]}]]}]}]]}]]}],{"children":["posts","$L11",{"children":[["slug","mongodb-replace-vs-set","d"],"$L12",{"children":["__PAGE__","$L13",{},null,false]},null,false]},null,false]},null,false],"$L14",false]],"m":"$undefined","G":["$15",[]],"s":false,"S":true}
-16:I[9766,[],""]
-17:I[8924,[],""]
-19:I[4431,[],"OutletBoundary"]
-1b:I[5278,[],"AsyncMetadataOutlet"]
-1d:I[4431,[],"ViewportBoundary"]
-1f:I[4431,[],"MetadataBoundary"]
-20:"$Sreact.suspense"
-10:["$","div",null,{"className":"min-w-0 flex-1","children":["$","$L16",null,{"parallelRouterKey":"children","error":"$undefined","errorStyles":"$undefined","errorScripts":"$undefined","template":["$","$L17",null,{}],"templateStyles":"$undefined","templateScripts":"$undefined","notFound":[[["$","title",null,{"children":"404: This page could not be found."}],["$","div",null,{"style":{"fontFamily":"system-ui,\"Segoe UI\",Roboto,Helvetica,Arial,sans-serif,\"Apple Color Emoji\",\"Segoe UI Emoji\"","height":"100vh","textAlign":"center","display":"flex","flexDirection":"column","alignItems":"center","justifyContent":"center"},"children":["$","div",null,{"children":[["$","style",null,{"dangerouslySetInnerHTML":{"__html":"body{color:#000;background:#fff;margin:0}.next-error-h1{border-right:1px solid rgba(0,0,0,.3)}@media (prefers-color-scheme:dark){body{color:#fff;background:#000}.next-error-h1{border-right:1px solid rgba(255,255,255,.3)}}"}}],["$","h1",null,{"className":"next-error-h1","style":{"display":"inline-block","margin":"0 20px 0 0","padding":"0 23px 0 0","fontSize":24,"fontWeight":500,"verticalAlign":"top","lineHeight":"49px"},"children":404}],["$","div",null,{"style":{"display":"inline-block"},"children":["$","h2",null,{"style":{"fontSize":14,"fontWeight":400,"lineHeight":"49px","margin":0},"children":"This page could not be found."}]}]]}]}]],[]],"forbidden":"$undefined","unauthorized":"$undefined"}]}]
-11:["$","$1","c",{"children":[null,["$","$L16",null,{"parallelRouterKey":"children","error":"$undefined","errorStyles":"$undefined","errorScripts":"$undefined","template":["$","$L17",null,{}],"templateStyles":"$undefined","templateScripts":"$undefined","notFound":"$undefined","forbidden":"$undefined","unauthorized":"$undefined"}]]}]
-12:["$","$1","c",{"children":[null,["$","$L16",null,{"parallelRouterKey":"children","error":"$undefined","errorStyles":"$undefined","errorScripts":"$undefined","template":["$","$L17",null,{}],"templateStyles":"$undefined","templateScripts":"$undefined","notFound":"$undefined","forbidden":"$undefined","unauthorized":"$undefined"}]]}]
-13:["$","$1","c",{"children":["$L18",null,["$","$L19",null,{"children":["$L1a",["$","$L1b",null,{"promise":"$@1c"}]]}]]}]
-14:["$","$1","h",{"children":[null,[["$","$L1d",null,{"children":"$L1e"}],null],["$","$L1f",null,{"children":["$","div",null,{"hidden":true,"children":["$","$20",null,{"fallback":null,"children":"$L21"}]}]}]]}]
-18:["$","div",null,{"className":"xl:flex xl:items-start xl:gap-s-8","children":[["$","article",null,{"className":"max-w-article min-w-0 flex-1","children":[["$","$L3",null,{"href":"/","className":"text-sm text-ink-500 hover:underline","children":"← 목록으로"}],["$","div",null,{"className":"mt-s-6","children":["$","$L3",null,{"href":"/categories/실험로그/","className":"eyebrow hover:text-blue-600","children":"실험로그"}]}],["$","div",null,{"className":"eyebrow text-blue-600 mt-1","children":"분산 시스템 실증 실험"}],["$","h1",null,{"className":"text-h1 mt-2 mb-s-6","children":"MongoDB replaceOne vs $set: 예측이 두 번 빗나갔다"}],["$","p",null,{"className":"text-lead text-ink-500 mb-s-7","children":"dirty bytes 1.9x(예측 33x), oplog 175x(예측 33x), 8.0 버전 주의사항"}],["$","div",null,{"className":"flex flex-wrap gap-s-3 mb-s-7","children":[["$","$L3","MongoDB",{"href":"/tags/MongoDB/","className":"eyebrow rounded-full border border-ink-200 px-s-3 py-1 hover:border-blue-600 hover:text-blue-600","children":["#","MongoDB"]}]]}],["$","div",null,{"className":"hairline mb-s-7"}],"$L22",["$","nav",null,{"className":"mt-s-9 flex justify-between gap-s-5 hairline pt-s-6 text-sm","children":[["$","span",null,{"children":["$","$L3",null,{"href":"/posts/redis-distributed-lock/","children":["← ","Redis 분산락을 달았더니 처리량이 16배 떨어졌다"]}]}],["$","span",null,{"children":["$","$L3",null,{"href":"/posts/mongodb-hot-document/","children":["핫 도큐먼트는 자기만 느린 게 아니다"," →"]}]}]]}]]}],["$","aside",null,{"className":"hidden xl:block xl:w-56 xl:shrink-0 xl:sticky xl:top-s-9","children":["$","nav",null,{"aria-label":"이 페이지에서","className":"border-l border-ink-200 pl-s-4 text-sm","children":[["$","div",null,{"className":"eyebrow mb-s-3","children":"이 페이지에서"}],["$","ul",null,{"className":"space-y-s-2","children":[["$","li","배경-wiredtiger-cache와-dirty-bytes",{"className":"","children":["$","a",null,{"href":"#배경-wiredtiger-cache와-dirty-bytes","className":"text-ink-600 hover:text-blue-600 transition-colors","children":"배경: WiredTiger cache와 dirty bytes"}]}],["$","li","실험-설계",{"className":"","children":["$","a",null,{"href":"#실험-설계","className":"text-ink-600 hover:text-blue-600 transition-colors","children":"실험 설계"}]}],["$","li","실측-결과",{"className":"","children":["$","a",null,{"href":"#실측-결과","className":"text-ink-600 hover:text-blue-600 transition-colors","children":"실측 결과"}]}],["$","li","throughput-opss",{"className":"pl-s-4","children":["$","a",null,{"href":"#throughput-opss","className":"text-ink-600 hover:text-blue-600 transition-colors","children":"Throughput (ops/s)"}]}],["$","li","wiredtiger-dirty-bytes-peak-262-mb-기준-",{"className":"pl-s-4","children":["$","a",null,{"href":"#wiredtiger-dirty-bytes-peak-262-mb-기준-","className":"text-ink-600 hover:text-blue-600 transition-colors","children":"WiredTiger Dirty Bytes Peak (262 MB 기준 %)"}]}],["$","li","write-queue-peak-write-ticket-경합-지표",{"className":"pl-s-4","children":["$","a",null,{"href":"#write-queue-peak-write-ticket-경합-지표","className":"text-ink-600 hover:text-blue-600 transition-colors","children":"Write Queue Peak (write ticket 경합 지표)"}]}],["$","li","예측-1이-빗나간-이유-dirty-bytes-33x--19x",{"className":"","children":["$","a",null,{"href":"#예측-1이-빗나간-이유-dirty-bytes-33x--19x","className":"text-ink-600 hover:text-blue-600 transition-colors","children":"예측 1이 빗나간 이유: dirty bytes 33x → 1.9x"}]}],["$","li","예측-2가-더-크게-빗나간-이유-oplog-33x--175x",{"className":"","children":["$","a",null,{"href":"#예측-2가-더-크게-빗나간-이유-oplog-33x--175x","className":"text-ink-600 hover:text-blue-600 transition-colors","children":"예측 2가 더 크게 빗나간 이유: oplog 33x → 175x"}]}],["$","li","oplog는-설정-크기를-초과해서-성장합니다-mongodb-40",{"className":"pl-s-4","children":["$","a",null,{"href":"#oplog는-설정-크기를-초과해서-성장합니다-mongodb-40","className":"text-ink-600 hover:text-blue-600 transition-colors","children":"oplog는 설정 크기를 초과해서 성장합니다 (MongoDB 4.0+)"}]}],["$","li","wiredtiger-cache가-동적으로-확장됐습니다",{"className":"","children":["$","a",null,{"href":"#wiredtiger-cache가-동적으로-확장됐습니다","className":"text-ink-600 hover:text-blue-600 transition-colors","children":"WiredTiger cache가 동적으로 확장됐습니다"}]}],["$","li","실무-시사점",{"className":"","children":["$","a",null,{"href":"#실무-시사점","className":"text-ink-600 hover:text-blue-600 transition-colors","children":"실무 시사점"}]}],"$L23","$L24","$L25","$L26","$L27","$L28"]}]]}]}]]}]
-23:["$","li","모니터링-알람-기준",{"className":"pl-s-4","children":["$","a",null,{"href":"#모니터링-알람-기준","className":"text-ink-600 hover:text-blue-600 transition-colors","children":"모니터링 알람 기준"}]}]
-24:["$","li","mongodb-80에서-달라지는-두-가지",{"className":"","children":["$","a",null,{"href":"#mongodb-80에서-달라지는-두-가지","className":"text-ink-600 hover:text-blue-600 transition-colors","children":"MongoDB 8.0에서 달라지는 두 가지"}]}]
-25:["$","li","1-writerapplier-thread-분리--측정-지표가-바뀌었습니다",{"className":"pl-s-4","children":["$","a",null,{"href":"#1-writerapplier-thread-분리--측정-지표가-바뀌었습니다","className":"text-ink-600 hover:text-blue-600 transition-colors","children":"1. writer/applier thread 분리 → 측정 지표가 바뀌었습니다"}]}]
-26:["$","li","2-wmajority가-더-일찍-반환됩니다",{"className":"pl-s-4","children":["$","a",null,{"href":"#2-wmajority가-더-일찍-반환됩니다","className":"text-ink-600 hover:text-blue-600 transition-colors","children":"2. w:majority가 더 일찍 반환됩니다"}]}]
-27:["$","li","두-예측이-다른-방향으로-빗나간-이유",{"className":"","children":["$","a",null,{"href":"#두-예측이-다른-방향으로-빗나간-이유","className":"text-ink-600 hover:text-blue-600 transition-colors","children":"두 예측이 다른 방향으로 빗나간 이유"}]}]
-28:["$","li","재현-방법",{"className":"","children":["$","a",null,{"href":"#재현-방법","className":"text-ink-600 hover:text-blue-600 transition-colors","children":"재현 방법"}]}]
-1e:[["$","meta","0",{"charSet":"utf-8"}],["$","meta","1",{"name":"viewport","content":"width=device-width, initial-scale=1"}]]
-1a:null
-1c:{"metadata":[["$","title","0",{"children":"kmando blog"}],["$","meta","1",{"name":"description","content":"실험으로 검증한 기술 이야기를 씁니다."}]],"error":null,"digest":"$undefined"}
-21:"$1c:metadata"
-22:["$","div",null,{"className":"max-w-none text-body [&_h2]:text-h2 [&_h2]:mt-s-8 [&_h2]:mb-s-5 [&_h3]:text-h3 [&_h3]:mt-s-7 [&_h3]:mb-s-4 [&_p]:mb-s-5 [&_pre]:rounded-md [&_pre]:p-s-5 [&_pre]:overflow-x-auto [&_pre]:my-s-6 [&_code]:text-code [&_ul]:list-disc [&_ul]:pl-s-5 [&_ul]:mb-s-5 [&_ol]:list-decimal [&_ol]:pl-s-5 [&_ol]:mb-s-5 [&_blockquote]:border-l-2 [&_blockquote]:border-ink-300 [&_blockquote]:pl-s-4 [&_blockquote]:text-ink-600 [&_blockquote]:mb-s-5 [&_table]:w-full [&_table]:mb-s-5 [&_th]:text-left [&_th]:border-b [&_th]:border-ink-300 [&_th]:pb-s-3 [&_td]:border-b [&_td]:border-ink-100 [&_td]:py-s-3 [&_img]:max-w-full [&_img]:h-auto [&_img]:rounded-md [&_img]:my-s-6","children":[["$","p","p-0",{"children":[["$","strong","strong-0",{"children":"스택"}],": MongoDB 7.0.37 / Python pymongo 4.14"]}],"\n",["$","hr","hr-0",{}],"\n",["$","p","p-1",{"children":"실험을 시작하기 전에 두 가지를 예측했습니다."}],"\n",["$","p","p-2",{"children":["첫 번째: ",["$","code","code-0",{"children":"replaceOne"}],"은 100KB 문서를 통째로 쓰니까 WiredTiger dirty bytes가 ",["$","code","code-1",{"children":"$$set"}]," 대비 33배 쌓일 것이다."]}],"\n",["$","p","p-3",{"children":"두 번째: oplog 크기 차이도 33배쯤 날 것이다. 100KB vs 3KB이니까."}],"\n",["$","p","p-4",{"children":["결과는 둘 다 틀렸습니다. dirty bytes 비율은 예측의 1/17인 ",["$","strong","strong-0",{"children":"1.9배"}],"였습니다. oplog 비율은 예측의 5배인 ",["$","strong","strong-1",{"children":"175배"}],"였습니다. 같은 원리에서 나온 예측이 정반대 방향으로 빗나갔습니다."]}],"\n",["$","hr","hr-1",{}],"\n",["$","h2","h2-0",{"id":"배경-wiredtiger-cache와-dirty-bytes","children":"배경: WiredTiger cache와 dirty bytes"}],"\n",["$","p","p-5",{"children":"MongoDB는 내부 스토리지 엔진으로 WiredTiger를 씁니다. 쓰기 작업은 디스크가 아닌 WiredTiger cache(메모리)에 먼저 반영됩니다. cache에서 아직 디스크로 내려가지 않은 데이터를 dirty bytes라고 합니다."}],"\n",["$","p","p-6",{"children":"dirty bytes가 일정 비율(기본 20%)을 넘으면 background eviction worker가 page를 디스크로 flush합니다. 이 비율을 초과하면 application thread가 직접 eviction에 참여하고, write ticket을 소비하면서 다른 쓰기가 대기 줄에 쌓입니다."}],"\n",["$","p","p-7",{"children":[["$","code","code-0",{"children":"replaceOne"}],"은 100KB 문서 전체를 교체합니다. ",["$","code","code-1",{"children":"$$set"}],"은 필드 3개만 바꿉니다. 두 방식이 dirty bytes에 얼마나 다른 압력을 주는지 격리 환경에서 측정했습니다."]}],"\n",["$","hr","hr-2",{}],"\n",["$","h2","h2-1",{"id":"실험-설계","children":"실험 설계"}],"\n",["$","p","p-8",{"children":"의도적으로 가혹한 조건을 만들었습니다."}],"\n",["$","pre","pre-0",{"children":["$","code","code-0",{"children":"MongoDB:              7.0.37 (단일 노드 replica set rs0)\nWiredTiger cache:     262 MB  (--wiredTigerCacheSizeGB 0.256)\nEviction worker 수:   최소 (threads_min=1, threads_max=2)\n컬렉션 크기:          1,000 docs × ~100 KB ≈ 97.8 MB\n부하:                 workers 4→16→64→128→256 × 각 60초\n"}]}],"\n",["$","p","p-9",{"children":"cache를 작게, eviction worker를 최소화한 이유는 dirty pressure cliff를 빠르게 재현하기 위해서입니다. 차이는 하나뿐입니다."}],"\n",["$","figure","figure-0",{"data-rehype-pretty-code-figure":"","children":["$","pre","pre-0",{"style":{"backgroundColor":"#fff","color":"#24292e"},"tabIndex":0,"data-language":"python","data-theme":"github-light","children":["$","code","code-0",{"data-language":"python","data-theme":"github-light","style":{"display":"grid"},"children":[["$","span","span-0",{"data-line":"","children":["$","span","span-0",{"style":{"color":"#6A737D"},"children":"# Full Replace — 100KB 문서 전체 교체"}]}],"\n",["$","span","span-1",{"data-line":"","children":[["$","span","span-0",{"style":{"color":"#24292E"},"children":"coll.replace_one({"}],["$","span","span-1",{"style":{"color":"#032F62"},"children":"\"_id\""}],["$","span","span-2",{"style":{"color":"#24292E"},"children":": uid}, full_100kb_doc)"}]]}],"\n",["$","span","span-2",{"data-line":"","children":" "}],"\n",["$","span","span-3",{"data-line":"","children":["$","span","span-0",{"style":{"color":"#6A737D"},"children":"# $set partial — 필드 3개만 업데이트"}]}],"\n",["$","span","span-4",{"data-line":"","children":[["$","span","span-0",{"style":{"color":"#24292E"},"children":"coll.update_one({"}],["$","span","span-1",{"style":{"color":"#032F62"},"children":"\"_id\""}],["$","span","span-2",{"style":{"color":"#24292E"},"children":": uid}, {"}],"$L29","$L2a"]}],"\n","$L2b","\n","$L2c","\n","$L2d","\n","$L2e"]}]}]}],"\n","$L2f","\n","$L30","\n","$L31","\n","$L32","\n","$L33","\n","$L34","\n","$L35","\n","$L36","\n","$L37","\n","$L38","\n","$L39","\n","$L3a","\n","$L3b","\n","$L3c","\n","$L3d","\n","$L3e","\n","$L3f","\n","$L40","\n","$L41","\n","$L42","\n","$L43","\n","$L44","\n","$L45","\n","$L46","\n","$L47","\n","$L48","\n","$L49","\n","$L4a","\n","$L4b","\n","$L4c","\n","$L4d","\n","$L4e","\n","$L4f","\n","$L50","\n","$L51","\n","$L52","\n","$L53","\n","$L54","\n","$L55","\n","$L56","\n","$L57","\n","$L58","\n","$L59","\n","$L5a","\n","$L5b","\n","$L5c","\n","$L5d","\n","$L5e","\n","$L5f","\n","$L60","\n","$L61","\n","$L62","\n","$L63","\n","$L64","\n","$L65","\n","$L66","\n","$L67","\n","$L68","\n","$L69","\n","$L6a","\n","$L6b","\n","$L6c","\n","$L6d"]}]
-29:["$","span","span-3",{"style":{"color":"#032F62"},"children":"\"$set\""}]
-2a:["$","span","span-4",{"style":{"color":"#24292E"},"children":": {"}]
-2b:["$","span","span-5",{"data-line":"","children":[["$","span","span-0",{"style":{"color":"#032F62"},"children":"    \"last_login\""}],["$","span","span-1",{"style":{"color":"#24292E"},"children":": now,"}]]}]
-2c:["$","span","span-6",{"data-line":"","children":[["$","span","span-0",{"style":{"color":"#032F62"},"children":"    \"view_count\""}],["$","span","span-1",{"style":{"color":"#24292E"},"children":": cnt,"}]]}]
-2d:["$","span","span-7",{"data-line":"","children":[["$","span","span-0",{"style":{"color":"#032F62"},"children":"    \"counter\""}],["$","span","span-1",{"style":{"color":"#24292E"},"children":": val,"}]]}]
-2e:["$","span","span-8",{"data-line":"","children":["$","span","span-0",{"style":{"color":"#24292E"},"children":"}})"}]}]
-2f:["$","blockquote","blockquote-0",{"children":["\n",["$","p","p-0",{"children":[["$","strong","strong-0",{"children":"버전 주의"}],": 이 실험은 MongoDB 7.0 기준입니다. 8.0에서는 동작이 달라지는 항목이 두 가지 있습니다. 실험 결과 이후에 정리했습니다."]}],"\n"]}]
-30:["$","hr","hr-3",{}]
-31:["$","h2","h2-2",{"id":"실측-결과","children":"실측 결과"}]
-32:["$","h3","h3-0",{"id":"throughput-opss","children":"Throughput (ops/s)"}]
-33:["$","table","table-0",{"children":[["$","thead","thead-0",{"children":["$","tr","tr-0",{"children":[["$","th","th-0",{"children":"workers"}],["$","th","th-1",{"children":"Full Replace"}],["$","th","th-2",{"children":"$$set partial"}],["$","th","th-3",{"children":"$$set 이점"}]]}]}],["$","tbody","tbody-0",{"children":[["$","tr","tr-0",{"children":[["$","td","td-0",{"children":"4"}],["$","td","td-1",{"children":"8,407"}],["$","td","td-2",{"children":"12,664"}],["$","td","td-3",{"children":["$","strong","strong-0",{"children":"+51%"}]}]]}],["$","tr","tr-1",{"children":[["$","td","td-0",{"children":"16"}],["$","td","td-1",{"children":"9,298"}],["$","td","td-2",{"children":"11,423"}],["$","td","td-3",{"children":"+23%"}]]}],["$","tr","tr-2",{"children":[["$","td","td-0",{"children":"64"}],["$","td","td-1",{"children":"8,191"}],["$","td","td-2",{"children":"11,548"}],["$","td","td-3",{"children":"+41%"}]]}],["$","tr","tr-3",{"children":[["$","td","td-0",{"children":"128"}],["$","td","td-1",{"children":"8,639"}],["$","td","td-2",{"children":"10,562"}],["$","td","td-3",{"children":"+22%"}]]}],["$","tr","tr-4",{"children":[["$","td","td-0",{"children":"256"}],["$","td","td-1",{"children":"6,832"}],["$","td","td-2",{"children":"8,897"}],["$","td","td-3",{"children":["$","strong","strong-0",{"children":"+30%"}]}]]}]]}]]}]
-34:["$","p","p-10",{"children":["$$set이 전 구간에서 22~51% 빠릅니다. workers=256에서 Full Replace는 workers=16 대비 ",["$","strong","strong-0",{"children":"26% 하락"}],"하지만 $set은 ",["$","strong","strong-1",{"children":"22% 하락"}],"에 그칩니다. 부하가 높을수록 격차가 벌어집니다."]}]
-35:["$","h3","h3-1",{"id":"wiredtiger-dirty-bytes-peak-262-mb-기준-","children":"WiredTiger Dirty Bytes Peak (262 MB 기준 %)"}]
-36:["$","table","table-1",{"children":[["$","thead","thead-0",{"children":["$","tr","tr-0",{"children":[["$","th","th-0",{"children":"workers"}],["$","th","th-1",{"children":"Full Replace"}],["$","th","th-2",{"children":"$$set partial"}]]}]}],["$","tbody","tbody-0",{"children":[["$","tr","tr-0",{"children":[["$","td","td-0",{"children":"4"}],["$","td","td-1",{"children":["$","strong","strong-0",{"children":"333% [OVERFLOW]"}]}],["$","td","td-2",{"children":"102%"}]]}],["$","tr","tr-1",{"children":[["$","td","td-0",{"children":"16"}],["$","td","td-1",{"children":["$","strong","strong-0",{"children":"315% [OVERFLOW]"}]}],["$","td","td-2",{"children":"100%"}]]}],["$","tr","tr-2",{"children":[["$","td","td-0",{"children":"64"}],["$","td","td-1",{"children":["$","strong","strong-0",{"children":"360% [OVERFLOW]"}]}],["$","td","td-2",{"children":"98%"}]]}],["$","tr","tr-3",{"children":[["$","td","td-0",{"children":"128"}],["$","td","td-1",{"children":["$","strong","strong-0",{"children":"335% [OVERFLOW]"}]}],["$","td","td-2",{"children":"101%"}]]}],["$","tr","tr-4",{"children":[["$","td","td-0",{"children":"256"}],["$","td","td-1",{"children":["$","strong","strong-0",{"children":"355% [OVERFLOW]"}]}],["$","td","td-2",{"children":"101%"}]]}]]}]]}]
-37:["$","p","p-11",{"children":["Full Replace는 ",["$","strong","strong-0",{"children":"모든 부하 단계에서"}]," 설정 cache의 3~3.6배를 초과합니다. $set은 262 MB 경계선 수준에서 안정적으로 유지됩니다."]}]
-38:["$","h3","h3-2",{"id":"write-queue-peak-write-ticket-경합-지표","children":"Write Queue Peak (write ticket 경합 지표)"}]
-39:["$","table","table-2",{"children":[["$","thead","thead-0",{"children":["$","tr","tr-0",{"children":[["$","th","th-0",{"children":"workers"}],["$","th","th-1",{"children":"Full Replace"}],["$","th","th-2",{"children":"$$set partial"}]]}]}],["$","tbody","tbody-0",{"children":[["$","tr","tr-0",{"children":[["$","td","td-0",{"children":"4"}],["$","td","td-1",{"children":"0"}],["$","td","td-2",{"children":"0"}]]}],["$","tr","tr-1",{"children":[["$","td","td-0",{"children":"16"}],["$","td","td-1",{"children":"5"}],["$","td","td-2",{"children":"0"}]]}],["$","tr","tr-2",{"children":[["$","td","td-0",{"children":"64"}],["$","td","td-1",{"children":["$","strong","strong-0",{"children":"53"}]}],["$","td","td-2",{"children":"0"}]]}],["$","tr","tr-3",{"children":[["$","td","td-0",{"children":"128"}],["$","td","td-1",{"children":"0"}],["$","td","td-2",{"children":"66"}]]}],["$","tr","tr-4",{"children":[["$","td","td-0",{"children":"256"}],["$","td","td-1",{"children":["$","strong","strong-0",{"children":"173"}]}],["$","td","td-2",{"children":"0"}]]}]]}]]}]
-3a:["$","p","p-12",{"children":"Full Replace에서 workers=64부터 write queue가 폭발합니다. workers=256에서 173. $set은 전 구간 0을 유지합니다 (workers=128의 66은 측정 노이즈로 분류)."}]
-3b:["$","hr","hr-4",{}]
-3c:["$","h2","h2-3",{"id":"예측-1이-빗나간-이유-dirty-bytes-33x--19x","children":"예측 1이 빗나간 이유: dirty bytes 33x → 1.9x"}]
-3d:["$","p","p-13",{"children":["예측은 \"100KB vs 3KB = 33배 차이\"였습니다. 실측은 ",["$","strong","strong-0",{"children":"1.9배"}],"였습니다."]}]
-3e:["$","p","p-14",{"children":["이유는 WiredTiger가 dirty 상태를 ",["$","strong","strong-0",{"children":"page 단위"}],"로 추적하기 때문입니다."]}]
-3f:["$","pre","pre-1",{"children":["$","code","code-0",{"children":"WiredTiger dirty tracking:\n\nFull Replace:  100KB page dirty\n$set partial:  100KB page dirty (같은 page!)\n\n두 방식 모두 동일한 100KB page를 dirty로 만든다.\npage cost = 동일\n\n추가 비용:\n  Full Replace: 100KB update chain\n  $set:         ~3KB delta\n\n총 비용 비율 = (100KB + 100KB) / (100KB + 3KB) ≈ 1.9×\n"}]}]
-40:["$","p","p-15",{"children":["100KB 문서를 수정하면 어떤 방법으로 수정하든 그 page(100KB)가 dirty가 됩니다. ",["$","code","code-0",{"children":"$$set"}],"으로 3개 필드만 바꿔도 dirty page 비용은 100KB입니다. 따라서 비율은 33배가 아닌 1.9배입니다."]}]
-41:["$","p","p-16",{"children":["그런데도 Full Replace의 throughput이 22~51% 낮은 이유가 있습니다. 절대 수치가 다릅니다. Full Replace dirty bytes 평균 442 MB(262MB 기준 169%)는 cache를 넘어 ",["$","strong","strong-0",{"children":"application thread eviction"}],"을 유발합니다. 이 eviction이 write ticket을 소비하고 write queue를 키웁니다. 비율은 1.9배지만 Full Replace는 항상 한계선을 넘어, $set은 항상 한계선 아래에 머무릅니다."]}]
-42:["$","p","p-17",{"children":"혹시 \"dirty bytes 비율이 1.9배면 큰 차이 아닌 것 아닌가?\"라고 생각하셨나요? 수치가 작아 보여도, Full Replace가 항상 300%를 초과하고 $set이 항상 100%에 머문다면 WiredTiger가 경험하는 스트레스는 완전히 다릅니다."}]
-43:["$","hr","hr-5",{}]
-44:["$","h2","h2-4",{"id":"예측-2가-더-크게-빗나간-이유-oplog-33x--175x","children":"예측 2가 더 크게 빗나간 이유: oplog 33x → 175x"}]
-45:["$","p","p-18",{"children":"oplog는 MongoDB가 복제를 위해 기록하는 변경 로그입니다. secondary 노드가 oplog를 읽어 데이터를 동기화합니다. oplog 크기는 secondary lag, 복제 대역폭, 디스크 write throughput 모두에 직접 영향을 줍니다."}]
-46:["$","pre","pre-2",{"children":["$","code","code-0",{"children":"Full Replace oplog entry: 100,992 bytes (98.6 KB)\n$set oplog entry:             575 bytes  (0.6 KB)\n비율: 175x   (예측: 33x)\n"}]}]
-47:["$","p","p-19",{"children":["예측이 5배 이상 빗나간 이유가 있습니다. Full Replace는 oplog에 ",["$","strong","strong-0",{"children":"문서 전체를 JSON으로 직렬화"}],"해서 씁니다. 100KB 문서가 그대로 oplog entry에 들어갑니다. ",["$","code","code-0",{"children":"$$set"}],"은 변경된 필드 3개의 diff만 씁니다."]}]
-48:["$","h3","h3-3",{"id":"oplog는-설정-크기를-초과해서-성장합니다-mongodb-40","children":"oplog는 설정 크기를 초과해서 성장합니다 (MongoDB 4.0+)"}]
-49:["$","p","p-20",{"children":"혹시 \"oplog 크기를 제한하면 디스크 걱정 없다\"고 생각하고 계신가요? MongoDB 4.0부터 oplog는 configured size를 넘어서 성장할 수 있습니다."}]
-4a:["$","p","p-21",{"children":"공식 문서의 설명입니다."}]
-4b:["$","blockquote","blockquote-1",{"children":["\n",["$","p","p-0",{"children":[["$","em","em-0",{"children":"\"Unlike other capped collections, the oplog can grow past its configured size limit to avoid deleting the majority commit point.\""}],"\n— MongoDB Replica Set Oplog"]}],"\n"]}]
-4c:["$","p","p-22",{"children":"majority commit point가 뒤처지면 oplog를 truncate하지 않고 디스크를 더 씁니다. Full Replace의 175x oplog가 복제 lag을 유발하면, oplog는 configured size를 넘어 bloat됩니다. \"Oplog 윈도우가 줄어든다\"보다 \"Oplog 디스크가 폭증한다\"가 더 정확한 표현입니다."}]
-4d:["$","hr","hr-6",{}]
-4e:["$","h2","h2-5",{"id":"wiredtiger-cache가-동적으로-확장됐습니다","children":"WiredTiger cache가 동적으로 확장됐습니다"}]
-4f:["$","p","p-23",{"children":["실험 중 흥미로운 현상이 있었습니다. 설정값은 262 MB였는데, 실험 중 ",["$","code","code-0",{"children":"maximum bytes configured"}]," 필드가 ",["$","strong","strong-0",{"children":"8.5 GB"}],"(Docker VM RAM 한도)로 자동 확장됐습니다."]}]
-50:["$","p","p-24",{"children":"Full Replace의 dirty bytes(평균 442 MB)가 설정 cache(262 MB)를 초과하자 WiredTiger가 OS 메모리 한도까지 cache를 늘린 것입니다. 이 동적 확장이 없었다면 OOM이나 더 극단적인 성능 저하가 발생했을 것입니다. $set의 dirty bytes(평균 238 MB)는 설정 내에서 안정적으로 운용됐습니다."}]
-51:["$","hr","hr-7",{}]
-52:["$","h2","h2-6",{"id":"실무-시사점","children":"실무 시사점"}]
-53:["$","figure","figure-1",{"data-rehype-pretty-code-figure":"","children":["$","pre","pre-0",{"style":{"backgroundColor":"#fff","color":"#24292e"},"tabIndex":0,"data-language":"python","data-theme":"github-light","children":["$","code","code-0",{"data-language":"python","data-theme":"github-light","style":{"display":"grid"},"children":[["$","span","span-0",{"data-line":"","children":["$","span","span-0",{"style":{"color":"#6A737D"},"children":"# 나쁜 예: ODM save() 주의 — 일부 구현이 full replace를 씀"}]}],"\n",["$","span","span-1",{"data-line":"","children":[["$","span","span-0",{"style":{"color":"#24292E"},"children":"coll.replace_one({"}],["$","span","span-1",{"style":{"color":"#032F62"},"children":"\"_id\""}],["$","span","span-2",{"style":{"color":"#24292E"},"children":": uid}, user_doc)"}]]}],"\n",["$","span","span-2",{"data-line":"","children":" "}],"\n",["$","span","span-3",{"data-line":"","children":["$","span","span-0",{"style":{"color":"#6A737D"},"children":"# 좋은 예: 변경된 필드만 지정"}]}],"\n",["$","span","span-4",{"data-line":"","children":[["$","span","span-0",{"style":{"color":"#24292E"},"children":"coll.update_one({"}],["$","span","span-1",{"style":{"color":"#032F62"},"children":"\"_id\""}],["$","span","span-2",{"style":{"color":"#24292E"},"children":": uid}, {"}],["$","span","span-3",{"style":{"color":"#032F62"},"children":"\"$set\""}],["$","span","span-4",{"style":{"color":"#24292E"},"children":": {"}]]}],"\n",["$","span","span-5",{"data-line":"","children":[["$","span","span-0",{"style":{"color":"#032F62"},"children":"    \"last_login\""}],["$","span","span-1",{"style":{"color":"#24292E"},"children":": now,"}]]}],"\n",["$","span","span-6",{"data-line":"","children":[["$","span","span-0",{"style":{"color":"#032F62"},"children":"    \"view_count\""}],["$","span","span-1",{"style":{"color":"#24292E"},"children":": cnt,"}]]}],"\n",["$","span","span-7",{"data-line":"","children":[["$","span","span-0",{"style":{"color":"#032F62"},"children":"    \"counter\""}],["$","span","span-1",{"style":{"color":"#24292E"},"children":": val,"}]]}],"\n",["$","span","span-8",{"data-line":"","children":["$","span","span-0",{"style":{"color":"#24292E"},"children":"}})"}]}]]}]}]}]
-54:["$","p","p-25",{"children":["ORM/ODM을 쓰고 있다면 내부 구현을 확인하세요. **Spring Data MongoDB의 ",["$","code","code-0",{"children":"save()"}],"는 ",["$","code","code-1",{"children":"replaceOne"}],", ",["$","code","code-2",{"children":"updateFirst()"}]," + ",["$","code","code-3",{"children":"Update"}],"는 partial ",["$","code","code-4",{"children":"$$set"}],"**입니다. Mongoose의 ",["$","code","code-5",{"children":"save()"}],"는 기본적으로 dirty field만 전송하지만 ",["$","code","code-6",{"children":"overwrite: true"}]," 옵션 시 full replace가 됩니다."]}]
-55:["$","p","p-26",{"children":"지금 운영 중인 코드가 replaceOne을 쓰는지 확인하는 가장 빠른 방법은 oplog를 한 번 들여다보는 것입니다. 100KB짜리 oplog entry가 보인다면 Full Replace가 쓰이고 있다는 신호입니다."}]
-56:["$","h3","h3-4",{"id":"모니터링-알람-기준","children":"모니터링 알람 기준"}]
-57:["$","pre","pre-3",{"children":["$","code","code-0",{"children":"cache: tracked dirty bytes / maximum bytes configured > 80%  → warning\nglobalLock.currentQueue.writers > 20                          → alert\ncache: pages evicted by application threads delta > 1/sec     → critical\n"}]}]
-58:["$","hr","hr-8",{}]
-59:["$","h2","h2-7",{"id":"mongodb-80에서-달라지는-두-가지","children":"MongoDB 8.0에서 달라지는 두 가지"}]
-5a:["$","p","p-27",{"children":"이 실험은 MongoDB 7.0 기준입니다. 8.0에서 두 가지 동작이 바뀌어서 재현 시 주의가 필요합니다."}]
-5b:["$","h3","h3-5",{"id":"1-writerapplier-thread-분리--측정-지표가-바뀌었습니다","children":"1. writer/applier thread 분리 → 측정 지표가 바뀌었습니다"}]
-5c:["$","p","p-28",{"children":"8.0부터 secondary가 oplog batch를 writer thread(수신)와 applier thread(적용)로 나눠서 병렬 처리합니다. 이에 따라 복제 모니터링 지표가 구식/신식으로 분리됐습니다."}]
-5d:["$","table","table-3",{"children":[["$","thead","thead-0",{"children":["$","tr","tr-0",{"children":[["$","th","th-0",{}],["$","th","th-1",{"children":"7.0 이하"}],["$","th","th-2",{"children":"8.0+"}]]}]}],["$","tbody","tbody-0",{"children":["$","tr","tr-0",{"children":[["$","td","td-0",{"children":"복제 버퍼 지표"}],["$","td","td-1",{"children":[["$","code","code-0",{"children":"metrics.repl.buffer.*"}]," (단일)"]}],["$","td","td-2",{"children":[["$","code","code-0",{"children":"metrics.repl.buffer.apply.*"}]," + ",["$","code","code-1",{"children":"metrics.repl.buffer.write.*"}]," (분리)"]}]]}]}]]}]
-5e:["$","p","p-29",{"children":["8.0 환경에서 복제 lag을 모니터링할 때는 ",["$","code","code-0",{"children":"metrics.repl.buffer.apply.sizeBytes"}],"를 확인하세요. write buffer는 안정한데 apply buffer가 쌓이면 secondary applier 단계가 병목입니다."]}]
-5f:["$","h3","h3-6",{"id":"2-wmajority가-더-일찍-반환됩니다","children":"2. w:majority가 더 일찍 반환됩니다"}]
-60:["$","p","p-30",{"children":["7.0에서 ",["$","code","code-0",{"children":"w:\"majority\""}]," write concern은 secondary가 변경 사항을 **적용(applied)**할 때 반환했습니다. 8.0부터는 secondary가 oplog entry를 **수신(wrote)**할 때 반환합니다."]}]
-61:["$","pre","pre-4",{"children":["$","code","code-0",{"children":"7.0: commit 반환 = secondary가 변경 적용 완료\n8.0: commit 반환 = secondary가 oplog entry 수신 완료 (적용은 진행 중일 수 있음)\n"}]}]
-62:["$","p","p-31",{"children":"8.0 환경에서 commit 직후 secondary lag을 측정하면 7.0보다 lag이 남아있을 수 있습니다. 두 버전의 결과를 직접 비교하면 안 됩니다."}]
-63:["$","hr","hr-9",{}]
-64:["$","h2","h2-8",{"id":"두-예측이-다른-방향으로-빗나간-이유","children":"두 예측이 다른 방향으로 빗나간 이유"}]
-65:["$","p","p-32",{"children":"같은 \"100KB vs 3KB\"에서 출발한 예측이 반대 방향으로 틀렸습니다."}]
-66:["$","ul","ul-0",{"children":["\n",["$","li","li-0",{"children":[["$","strong","strong-0",{"children":"dirty bytes"}],": page-level tracking → 두 방식이 같은 page를 dirty → 실제보다 작게 예측"]}],"\n",["$","li","li-1",{"children":[["$","strong","strong-0",{"children":"oplog"}],": document-level serialization → full document 직렬화 → 실제보다 크게 예측"]}],"\n"]}]
-67:["$","p","p-33",{"children":"WiredTiger의 내부 동작을 두 레이어로 분리해서 이해해야 합니다. 메모리(dirty tracking)는 page 단위, 복제(oplog)는 document 단위입니다. 같은 연산이 레이어마다 다른 비용 구조를 가집니다."}]
-68:["$","p","p-34",{"children":"replaceOne을 쓰는 코드가 있다면 당장 바꾸는 것보다 먼저 oplog 크기와 dirty bytes 압력을 측정해보는 게 우선입니다. 어떤 문서를 얼마나 자주 교체하는지에 따라 영향 범위가 완전히 달라집니다."}]
-69:["$","hr","hr-10",{}]
-6a:["$","h2","h2-9",{"id":"재현-방법","children":"재현 방법"}]
-6b:["$","figure","figure-2",{"data-rehype-pretty-code-figure":"","children":["$","pre","pre-0",{"style":{"backgroundColor":"#fff","color":"#24292e"},"tabIndex":0,"data-language":"bash","data-theme":"github-light","children":["$","code","code-0",{"data-language":"bash","data-theme":"github-light","style":{"display":"grid"},"children":[["$","span","span-0",{"data-line":"","children":[["$","span","span-0",{"style":{"color":"#6F42C1"},"children":"docker"}],["$","span","span-1",{"style":{"color":"#032F62"},"children":" compose"}],["$","span","span-2",{"style":{"color":"#032F62"},"children":" up"}],["$","span","span-3",{"style":{"color":"#005CC5"},"children":" -d"}]]}],"\n",["$","span","span-1",{"data-line":"","children":[["$","span","span-0",{"style":{"color":"#6F42C1"},"children":"docker"}],["$","span","span-1",{"style":{"color":"#032F62"},"children":" exec"}],["$","span","span-2",{"style":{"color":"#032F62"},"children":" cliff-mongo"}],["$","span","span-3",{"style":{"color":"#032F62"},"children":" mongosh"}],["$","span","span-4",{"style":{"color":"#005CC5"},"children":" --eval"}],["$","span","span-5",{"style":{"color":"#005CC5"},"children":" \\"}]]}],"\n",["$","span","span-2",{"data-line":"","children":["$","span","span-0",{"style":{"color":"#032F62"},"children":"  'rs.initiate({_id:\"rs0\",members:[{_id:0,host:\"localhost:27017\"}]})'"}]}],"\n",["$","span","span-3",{"data-line":"","children":[["$","span","span-0",{"style":{"color":"#6F42C1"},"children":"sleep"}],["$","span","span-1",{"style":{"color":"#005CC5"},"children":" 5"}]]}],"\n",["$","span","span-4",{"data-line":"","children":[["$","span","span-0",{"style":{"color":"#6F42C1"},"children":"pip"}],["$","span","span-1",{"style":{"color":"#032F62"},"children":" install"}],["$","span","span-2",{"style":{"color":"#032F62"},"children":" pymongo"}]]}],"\n",["$","span","span-5",{"data-line":"","children":[["$","span","span-0",{"style":{"color":"#6F42C1"},"children":"python3"}],["$","span","span-1",{"style":{"color":"#032F62"},"children":" seed.py"}]]}],"\n",["$","span","span-6",{"data-line":"","children":[["$","span","span-0",{"style":{"color":"#6F42C1"},"children":"bash"}],["$","span","span-1",{"style":{"color":"#032F62"},"children":" run_ladder.sh"}]]}],"\n",["$","span","span-7",{"data-line":"","children":[["$","span","span-0",{"style":{"color":"#6F42C1"},"children":"python3"}],["$","span","span-1",{"style":{"color":"#032F62"},"children":" analyze.py"}]]}]]}]}]}]
-6c:["$","blockquote","blockquote-2",{"children":["\n",["$","p","p-0",{"children":[["$","strong","strong-0",{"children":"재현 시 버전 고정 권장"}],": MongoDB 7.0과 8.0은 복제 동작과 측정 지표가 다릅니다. 원 실험과 비교하려면 ",["$","code","code-0",{"children":"image: mongo:7.0"}],"으로 고정하세요."]}],"\n"]}]
-6d:["$","p","p-35",{"children":["실험 코드: ",["$","a","a-0",{"href":"https://github.com/kmando01/mongodb-write-cliff-bench","children":"kmando01/mongodb-write-cliff-bench"}]]}]
+0:{"P":null,"b":"wtFcU66J_sT41J_XZwju9","p":"","c":["","posts","mongodb-replace-vs-set",""],"i":false,"f":[[["",{"children":["posts",{"children":[["slug","mongodb-replace-vs-set","d"],{"children":["__PAGE__",{}]}]}]},"$undefined","$undefined",true],["",["$","$1","c",{"children":[[["$","link","0",{"rel":"stylesheet","href":"/_next/static/css/0b5605e146a03768.css","precedence":"next","crossOrigin":"$undefined","nonce":"$undefined"}]],["$","html",null,{"lang":"ko","suppressHydrationWarning":true,"children":[["$","head",null,{"children":["$","script",null,{"dangerouslySetInnerHTML":{"__html":"\n(function () {\n  try {\n    var stored = localStorage.getItem('theme');\n    var prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;\n    var theme = stored || (prefersDark ? 'dark' : 'light');\n    if (theme === 'dark') {\n      document.documentElement.classList.add('dark');\n    }\n  } catch (e) {}\n})();\n"}}]}],["$","body",null,{"children":["$","div",null,{"className":"mx-auto max-w-[1200px] px-6 md:px-10 py-s-9","children":[["$","div",null,{"className":"flex justify-between items-center mb-s-4","children":[["$","$L2",null,{}],["$","$L3",null,{}]]}],["$","div",null,{"className":"md:flex md:items-start md:gap-s-8","children":[["$","$L4",null,{"children":["$","div",null,{"children":[["$","$L5",null,{"href":"/","className":"block text-h3 mb-s-6 hover:text-blue-600 transition-colors","children":"기술 블로그"}],["$","$L6",null,{"groups":[{"series":null,"posts":[{"slug":"mongodb-transaction-connection-vs-session","title":"MongoDB 트랜잭션은 Connection이 아니라 Session 단위다","description":"같은 커넥션에서 커밋과 롤백이 동시에 발생하는 현상을 관찰하며, MongoDB 트랜잭션이 커넥션이 아닌 세션 단위로 관리된다는 사실을 실험으로 검증한 글","series":null,"order":0,"date":"2026-07-04","tags":["MongoDB"],"category":"실험로그","draft":false,"content":"$7"}],"latestDate":"2026-07-04"},{"series":null,"posts":[{"slug":"virtual-thread-oom-backpressure","title":"Virtual Thread가 OOM을 부른 이유: backpressure가 스레드에서 힙으로 옮겨간다","description":"Virtual Thread 환경에서 블로킹 I/O 병목이 backpressure를 사라지게 만들어, 스레드 대기 대신 힙 누적과 OOM으로 이어지는 메커니즘을 최소 재현 실험과 교차 비교로 검증한 글","series":null,"order":0,"date":"2026-07-04","tags":["Java"],"category":"실험로그","draft":false,"content":"$8"}],"latestDate":"2026-07-04"},{"series":"분산 시스템 실증 실험","posts":[{"slug":"redis-distributed-lock","title":"Redis 분산락을 달았더니 처리량이 16배 떨어졌다","description":"수학적 TPS 상한, writeConflict 제거의 역설","series":"분산 시스템 실증 실험","order":1,"date":"2026-06-29","tags":["Redis"],"category":"실험로그","draft":false,"content":"$9"},{"slug":"mongodb-replace-vs-set","title":"MongoDB replaceOne vs $set: 예측이 두 번 빗나갔다","description":"dirty bytes 1.9x(예측 33x), oplog 175x(예측 33x), 8.0 버전 주의사항","series":"분산 시스템 실증 실험","order":2,"date":"2026-06-29","tags":["MongoDB"],"category":"실험로그","draft":false,"content":"$a"},{"slug":"mongodb-hot-document","title":"핫 도큐먼트는 자기만 느린 게 아니다","description":"cold worker -55% 피해, write ticket pool 인질","series":"분산 시스템 실증 실험","order":3,"date":"2026-06-29","tags":["MongoDB"],"category":"실험로그","draft":false,"content":"$b"},{"slug":"mongodb-full-replace-replication","title":"MongoDB replaceOne이 secondary를 '멈춘다'는 말은 절반만 맞다","description":"공식 문서 5개 검증 — snapshot reads, oplog bloat, 8.0 변경사항","series":"분산 시스템 실증 실험","order":4,"date":"2026-06-29","tags":["MongoDB"],"category":"실험로그","draft":false,"content":"$c"},{"slug":"mongodb-write-payload-dual-failure","title":"MongoDB가 동시에 두 곳에서 무너지는 이유","description":"payload size가 WiredTiger dirty eviction과 chained applyOps를 동시에 압박하는 단일 변수","series":"분산 시스템 실증 실험","order":5,"date":"2026-06-30","tags":["MongoDB"],"category":"실험로그","draft":false,"content":"$d"}],"latestDate":"2026-06-30"},{"series":"MongoDB 실증 실험","posts":[{"slug":"mongodb-readonly-tx-silent-override","title":"`@Transactional(readOnly = true)`가 MongoDB read replica 부하 분산을 조용히 망가뜨린다","description":"@Transactional(readOnly=true)가 MongoDB read replica 부하 분산을 조용히 망가뜨리는 원인 분석","series":"MongoDB 실증 실험","order":1,"date":"2026-06-29","tags":["MongoDB","Spring"],"category":"실험로그","draft":false,"content":"$e"},{"slug":"mongo-secondary-read-annotation","title":"MongoDB secondary read 라우팅이 조용히 깨지는 이유 — @MongoSecondaryRead 로 봉인하기","description":"secondaryPreferred가 조용히 무시되는 원인과 @MongoSecondaryRead로 봉인하는 방법","series":"MongoDB 실증 실험","order":2,"date":"2026-06-29","tags":["MongoDB","Spring"],"category":"실험로그","draft":false,"content":"$f"}],"latestDate":"2026-06-29"},{"series":"JVM 가상 스레드 실증 실험","posts":[{"slug":"virtual-threads-nmt","title":"가상 스레드 10,000개의 OS 스레드는 몇 개인가","description":"OS 스레드 38배 절약, per-thread 78배 경량","series":"JVM 가상 스레드 실증 실험","order":1,"date":"2026-06-18","tags":["Java"],"category":"실험로그","draft":false,"content":"$10"},{"slug":"virtual-threads-hikaricp","title":"가상 스레드 400개를 켰을 때 p99에 무슨 일이 생기는가","description":"커넥션 풀이 새 천장, p50은 거짓말한다","series":"JVM 가상 스레드 실증 실험","order":2,"date":"2026-06-29","tags":["Java"],"category":"실험로그","draft":false,"content":"$11"},{"slug":"virtual-threads-pinning","title":"JEP 491이 고친 것과 고치지 못한 것 — synchronized vs JNI Pinning","description":"synchronized 해결, JNI pinning은 JDK 25에서도 잔존","series":"JVM 가상 스레드 실증 실험","order":3,"date":"2026-06-29","tags":["Java"],"category":"실험로그","draft":false,"content":"$12"},{"slug":"virtual-threads-memory","title":"가상 스레드 10만 개를 띄우기 전에 계산해야 할 두 가지","description":"Continuation 힙 비용, ThreadLocal × vthread = OOM","series":"JVM 가상 스레드 실증 실험","order":4,"date":"2026-06-29","tags":["Java"],"category":"실험로그","draft":false,"content":"$13"}],"latestDate":"2026-06-29"}]}]]}]}],"$L14"]}]]}]}]]}]]}],{"children":["posts","$L15",{"children":[["slug","mongodb-replace-vs-set","d"],"$L16",{"children":["__PAGE__","$L17",{},null,false]},null,false]},null,false]},null,false],"$L18",false]],"m":"$undefined","G":["$19",[]],"s":false,"S":true}
+1a:I[9766,[],""]
+1b:I[8924,[],""]
+1d:I[4431,[],"OutletBoundary"]
+1f:I[5278,[],"AsyncMetadataOutlet"]
+21:I[4431,[],"ViewportBoundary"]
+23:I[4431,[],"MetadataBoundary"]
+24:"$Sreact.suspense"
+14:["$","div",null,{"className":"min-w-0 flex-1","children":["$","$L1a",null,{"parallelRouterKey":"children","error":"$undefined","errorStyles":"$undefined","errorScripts":"$undefined","template":["$","$L1b",null,{}],"templateStyles":"$undefined","templateScripts":"$undefined","notFound":[[["$","title",null,{"children":"404: This page could not be found."}],["$","div",null,{"style":{"fontFamily":"system-ui,\"Segoe UI\",Roboto,Helvetica,Arial,sans-serif,\"Apple Color Emoji\",\"Segoe UI Emoji\"","height":"100vh","textAlign":"center","display":"flex","flexDirection":"column","alignItems":"center","justifyContent":"center"},"children":["$","div",null,{"children":[["$","style",null,{"dangerouslySetInnerHTML":{"__html":"body{color:#000;background:#fff;margin:0}.next-error-h1{border-right:1px solid rgba(0,0,0,.3)}@media (prefers-color-scheme:dark){body{color:#fff;background:#000}.next-error-h1{border-right:1px solid rgba(255,255,255,.3)}}"}}],["$","h1",null,{"className":"next-error-h1","style":{"display":"inline-block","margin":"0 20px 0 0","padding":"0 23px 0 0","fontSize":24,"fontWeight":500,"verticalAlign":"top","lineHeight":"49px"},"children":404}],["$","div",null,{"style":{"display":"inline-block"},"children":["$","h2",null,{"style":{"fontSize":14,"fontWeight":400,"lineHeight":"49px","margin":0},"children":"This page could not be found."}]}]]}]}]],[]],"forbidden":"$undefined","unauthorized":"$undefined"}]}]
+15:["$","$1","c",{"children":[null,["$","$L1a",null,{"parallelRouterKey":"children","error":"$undefined","errorStyles":"$undefined","errorScripts":"$undefined","template":["$","$L1b",null,{}],"templateStyles":"$undefined","templateScripts":"$undefined","notFound":"$undefined","forbidden":"$undefined","unauthorized":"$undefined"}]]}]
+16:["$","$1","c",{"children":[null,["$","$L1a",null,{"parallelRouterKey":"children","error":"$undefined","errorStyles":"$undefined","errorScripts":"$undefined","template":["$","$L1b",null,{}],"templateStyles":"$undefined","templateScripts":"$undefined","notFound":"$undefined","forbidden":"$undefined","unauthorized":"$undefined"}]]}]
+17:["$","$1","c",{"children":["$L1c",null,["$","$L1d",null,{"children":["$L1e",["$","$L1f",null,{"promise":"$@20"}]]}]]}]
+18:["$","$1","h",{"children":[null,[["$","$L21",null,{"children":"$L22"}],null],["$","$L23",null,{"children":["$","div",null,{"hidden":true,"children":["$","$24",null,{"fallback":null,"children":"$L25"}]}]}]]}]
+1c:["$","div",null,{"className":"xl:flex xl:items-start xl:gap-s-8","children":[["$","article",null,{"className":"max-w-article min-w-0 flex-1","children":[["$","$L5",null,{"href":"/","className":"text-sm text-ink-500 hover:underline","children":"← 목록으로"}],["$","div",null,{"className":"mt-s-6","children":["$","$L5",null,{"href":"/categories/실험로그/","className":"eyebrow hover:text-blue-600","children":"실험로그"}]}],["$","div",null,{"className":"eyebrow text-blue-600 mt-1","children":"분산 시스템 실증 실험"}],["$","h1",null,{"className":"text-h1 mt-2 mb-s-6","children":"MongoDB replaceOne vs $set: 예측이 두 번 빗나갔다"}],["$","p",null,{"className":"text-lead text-ink-500 mb-s-7","children":"dirty bytes 1.9x(예측 33x), oplog 175x(예측 33x), 8.0 버전 주의사항"}],["$","div",null,{"className":"flex flex-wrap gap-s-3 mb-s-7","children":[["$","$L5","MongoDB",{"href":"/tags/MongoDB/","className":"eyebrow rounded-full border border-ink-200 px-s-3 py-1 hover:border-blue-600 hover:text-blue-600","children":["#","MongoDB"]}]]}],["$","div",null,{"className":"hairline mb-s-7"}],"$L26",["$","nav",null,{"className":"mt-s-9 flex justify-between gap-s-5 hairline pt-s-6 text-sm","children":[["$","span",null,{"children":["$","$L5",null,{"href":"/posts/redis-distributed-lock/","children":["← ","Redis 분산락을 달았더니 처리량이 16배 떨어졌다"]}]}],["$","span",null,{"children":["$","$L5",null,{"href":"/posts/mongodb-hot-document/","children":["핫 도큐먼트는 자기만 느린 게 아니다"," →"]}]}]]}]]}],["$","aside",null,{"className":"hidden xl:block xl:w-56 xl:shrink-0 xl:sticky xl:top-s-9","children":["$","nav",null,{"aria-label":"이 페이지에서","className":"border-l border-ink-200 pl-s-4 text-sm","children":[["$","div",null,{"className":"eyebrow mb-s-3","children":"이 페이지에서"}],["$","ul",null,{"className":"space-y-s-2","children":[["$","li","배경-wiredtiger-cache와-dirty-bytes",{"className":"","children":["$","a",null,{"href":"#배경-wiredtiger-cache와-dirty-bytes","className":"text-ink-600 hover:text-blue-600 transition-colors","children":"배경: WiredTiger cache와 dirty bytes"}]}],["$","li","실험-설계",{"className":"","children":["$","a",null,{"href":"#실험-설계","className":"text-ink-600 hover:text-blue-600 transition-colors","children":"실험 설계"}]}],["$","li","실측-결과",{"className":"","children":["$","a",null,{"href":"#실측-결과","className":"text-ink-600 hover:text-blue-600 transition-colors","children":"실측 결과"}]}],["$","li","throughput-opss",{"className":"pl-s-4","children":["$","a",null,{"href":"#throughput-opss","className":"text-ink-600 hover:text-blue-600 transition-colors","children":"Throughput (ops/s)"}]}],["$","li","wiredtiger-dirty-bytes-peak-262-mb-기준-",{"className":"pl-s-4","children":["$","a",null,{"href":"#wiredtiger-dirty-bytes-peak-262-mb-기준-","className":"text-ink-600 hover:text-blue-600 transition-colors","children":"WiredTiger Dirty Bytes Peak (262 MB 기준 %)"}]}],["$","li","write-queue-peak-write-ticket-경합-지표",{"className":"pl-s-4","children":["$","a",null,{"href":"#write-queue-peak-write-ticket-경합-지표","className":"text-ink-600 hover:text-blue-600 transition-colors","children":"Write Queue Peak (write ticket 경합 지표)"}]}],["$","li","예측-1이-빗나간-이유-dirty-bytes-33x--19x",{"className":"","children":["$","a",null,{"href":"#예측-1이-빗나간-이유-dirty-bytes-33x--19x","className":"text-ink-600 hover:text-blue-600 transition-colors","children":"예측 1이 빗나간 이유: dirty bytes 33x → 1.9x"}]}],["$","li","예측-2가-더-크게-빗나간-이유-oplog-33x--175x",{"className":"","children":["$","a",null,{"href":"#예측-2가-더-크게-빗나간-이유-oplog-33x--175x","className":"text-ink-600 hover:text-blue-600 transition-colors","children":"예측 2가 더 크게 빗나간 이유: oplog 33x → 175x"}]}],["$","li","oplog는-설정-크기를-초과해서-성장합니다-mongodb-40",{"className":"pl-s-4","children":["$","a",null,{"href":"#oplog는-설정-크기를-초과해서-성장합니다-mongodb-40","className":"text-ink-600 hover:text-blue-600 transition-colors","children":"oplog는 설정 크기를 초과해서 성장합니다 (MongoDB 4.0+)"}]}],["$","li","wiredtiger-cache가-동적으로-확장됐습니다",{"className":"","children":["$","a",null,{"href":"#wiredtiger-cache가-동적으로-확장됐습니다","className":"text-ink-600 hover:text-blue-600 transition-colors","children":"WiredTiger cache가 동적으로 확장됐습니다"}]}],["$","li","실무-시사점",{"className":"","children":["$","a",null,{"href":"#실무-시사점","className":"text-ink-600 hover:text-blue-600 transition-colors","children":"실무 시사점"}]}],"$L27","$L28","$L29","$L2a","$L2b","$L2c"]}]]}]}]]}]
+27:["$","li","모니터링-알람-기준",{"className":"pl-s-4","children":["$","a",null,{"href":"#모니터링-알람-기준","className":"text-ink-600 hover:text-blue-600 transition-colors","children":"모니터링 알람 기준"}]}]
+28:["$","li","mongodb-80에서-달라지는-두-가지",{"className":"","children":["$","a",null,{"href":"#mongodb-80에서-달라지는-두-가지","className":"text-ink-600 hover:text-blue-600 transition-colors","children":"MongoDB 8.0에서 달라지는 두 가지"}]}]
+29:["$","li","1-writerapplier-thread-분리--측정-지표가-바뀌었습니다",{"className":"pl-s-4","children":["$","a",null,{"href":"#1-writerapplier-thread-분리--측정-지표가-바뀌었습니다","className":"text-ink-600 hover:text-blue-600 transition-colors","children":"1. writer/applier thread 분리 → 측정 지표가 바뀌었습니다"}]}]
+2a:["$","li","2-wmajority가-더-일찍-반환됩니다",{"className":"pl-s-4","children":["$","a",null,{"href":"#2-wmajority가-더-일찍-반환됩니다","className":"text-ink-600 hover:text-blue-600 transition-colors","children":"2. w:majority가 더 일찍 반환됩니다"}]}]
+2b:["$","li","두-예측이-다른-방향으로-빗나간-이유",{"className":"","children":["$","a",null,{"href":"#두-예측이-다른-방향으로-빗나간-이유","className":"text-ink-600 hover:text-blue-600 transition-colors","children":"두 예측이 다른 방향으로 빗나간 이유"}]}]
+2c:["$","li","재현-방법",{"className":"","children":["$","a",null,{"href":"#재현-방법","className":"text-ink-600 hover:text-blue-600 transition-colors","children":"재현 방법"}]}]
+22:[["$","meta","0",{"charSet":"utf-8"}],["$","meta","1",{"name":"viewport","content":"width=device-width, initial-scale=1"}]]
+1e:null
+20:{"metadata":[["$","title","0",{"children":"kmando blog"}],["$","meta","1",{"name":"description","content":"실험으로 검증한 기술 이야기를 씁니다."}]],"error":null,"digest":"$undefined"}
+25:"$20:metadata"
+26:["$","div",null,{"className":"max-w-none text-body [&_h2]:text-h2 [&_h2]:mt-s-8 [&_h2]:mb-s-5 [&_h3]:text-h3 [&_h3]:mt-s-7 [&_h3]:mb-s-4 [&_p]:mb-s-5 [&_pre]:rounded-md [&_pre]:p-s-5 [&_pre]:overflow-x-auto [&_pre]:my-s-6 [&_code]:text-code [&_ul]:list-disc [&_ul]:pl-s-5 [&_ul]:mb-s-5 [&_ol]:list-decimal [&_ol]:pl-s-5 [&_ol]:mb-s-5 [&_blockquote]:border-l-2 [&_blockquote]:border-ink-300 [&_blockquote]:pl-s-4 [&_blockquote]:text-ink-600 [&_blockquote]:mb-s-5 [&_table]:w-full [&_table]:mb-s-5 [&_th]:text-left [&_th]:border-b [&_th]:border-ink-300 [&_th]:pb-s-3 [&_td]:border-b [&_td]:border-ink-100 [&_td]:py-s-3 [&_img]:max-w-full [&_img]:h-auto [&_img]:rounded-md [&_img]:my-s-6","children":[["$","p","p-0",{"children":[["$","strong","strong-0",{"children":"스택"}],": MongoDB 7.0.37 / Python pymongo 4.14"]}],"\n",["$","hr","hr-0",{}],"\n",["$","p","p-1",{"children":"실험을 시작하기 전에 두 가지를 예측했습니다."}],"\n",["$","p","p-2",{"children":["첫 번째: ",["$","code","code-0",{"children":"replaceOne"}],"은 100KB 문서를 통째로 쓰니까 WiredTiger dirty bytes가 ",["$","code","code-1",{"children":"$$set"}]," 대비 33배 쌓일 것이다."]}],"\n",["$","p","p-3",{"children":"두 번째: oplog 크기 차이도 33배쯤 날 것이다. 100KB vs 3KB이니까."}],"\n",["$","p","p-4",{"children":["결과는 둘 다 틀렸습니다. dirty bytes 비율은 예측의 1/17인 ",["$","strong","strong-0",{"children":"1.9배"}],"였습니다. oplog 비율은 예측의 5배인 ",["$","strong","strong-1",{"children":"175배"}],"였습니다. 같은 원리에서 나온 예측이 정반대 방향으로 빗나갔습니다."]}],"\n",["$","hr","hr-1",{}],"\n",["$","h2","h2-0",{"id":"배경-wiredtiger-cache와-dirty-bytes","children":"배경: WiredTiger cache와 dirty bytes"}],"\n",["$","p","p-5",{"children":"MongoDB는 내부 스토리지 엔진으로 WiredTiger를 씁니다. 쓰기 작업은 디스크가 아닌 WiredTiger cache(메모리)에 먼저 반영됩니다. cache에서 아직 디스크로 내려가지 않은 데이터를 dirty bytes라고 합니다."}],"\n",["$","p","p-6",{"children":"dirty bytes가 일정 비율(기본 20%)을 넘으면 background eviction worker가 page를 디스크로 flush합니다. 이 비율을 초과하면 application thread가 직접 eviction에 참여하고, write ticket을 소비하면서 다른 쓰기가 대기 줄에 쌓입니다."}],"\n",["$","p","p-7",{"children":[["$","code","code-0",{"children":"replaceOne"}],"은 100KB 문서 전체를 교체합니다. ",["$","code","code-1",{"children":"$$set"}],"은 필드 3개만 바꿉니다. 두 방식이 dirty bytes에 얼마나 다른 압력을 주는지 격리 환경에서 측정했습니다."]}],"\n",["$","hr","hr-2",{}],"\n",["$","h2","h2-1",{"id":"실험-설계","children":"실험 설계"}],"\n",["$","p","p-8",{"children":"의도적으로 가혹한 조건을 만들었습니다."}],"\n",["$","pre","pre-0",{"children":["$","code","code-0",{"children":"MongoDB:              7.0.37 (단일 노드 replica set rs0)\nWiredTiger cache:     262 MB  (--wiredTigerCacheSizeGB 0.256)\nEviction worker 수:   최소 (threads_min=1, threads_max=2)\n컬렉션 크기:          1,000 docs × ~100 KB ≈ 97.8 MB\n부하:                 workers 4→16→64→128→256 × 각 60초\n"}]}],"\n",["$","p","p-9",{"children":"cache를 작게, eviction worker를 최소화한 이유는 dirty pressure cliff를 빠르게 재현하기 위해서입니다. 차이는 하나뿐입니다."}],"\n",["$","figure","figure-0",{"data-rehype-pretty-code-figure":"","children":["$","pre","pre-0",{"style":{"backgroundColor":"#fff","color":"#24292e"},"tabIndex":0,"data-language":"python","data-theme":"github-light","children":["$","code","code-0",{"data-language":"python","data-theme":"github-light","style":{"display":"grid"},"children":[["$","span","span-0",{"data-line":"","children":["$","span","span-0",{"style":{"color":"#6A737D"},"children":"# Full Replace — 100KB 문서 전체 교체"}]}],"\n",["$","span","span-1",{"data-line":"","children":[["$","span","span-0",{"style":{"color":"#24292E"},"children":"coll.replace_one({"}],["$","span","span-1",{"style":{"color":"#032F62"},"children":"\"_id\""}],["$","span","span-2",{"style":{"color":"#24292E"},"children":": uid}, full_100kb_doc)"}]]}],"\n",["$","span","span-2",{"data-line":"","children":" "}],"\n",["$","span","span-3",{"data-line":"","children":["$","span","span-0",{"style":{"color":"#6A737D"},"children":"# $set partial — 필드 3개만 업데이트"}]}],"\n",["$","span","span-4",{"data-line":"","children":[["$","span","span-0",{"style":{"color":"#24292E"},"children":"coll.update_one({"}],["$","span","span-1",{"style":{"color":"#032F62"},"children":"\"_id\""}],["$","span","span-2",{"style":{"color":"#24292E"},"children":": uid}, {"}],"$L2d","$L2e"]}],"\n","$L2f","\n","$L30","\n","$L31","\n","$L32"]}]}]}],"\n","$L33","\n","$L34","\n","$L35","\n","$L36","\n","$L37","\n","$L38","\n","$L39","\n","$L3a","\n","$L3b","\n","$L3c","\n","$L3d","\n","$L3e","\n","$L3f","\n","$L40","\n","$L41","\n","$L42","\n","$L43","\n","$L44","\n","$L45","\n","$L46","\n","$L47","\n","$L48","\n","$L49","\n","$L4a","\n","$L4b","\n","$L4c","\n","$L4d","\n","$L4e","\n","$L4f","\n","$L50","\n","$L51","\n","$L52","\n","$L53","\n","$L54","\n","$L55","\n","$L56","\n","$L57","\n","$L58","\n","$L59","\n","$L5a","\n","$L5b","\n","$L5c","\n","$L5d","\n","$L5e","\n","$L5f","\n","$L60","\n","$L61","\n","$L62","\n","$L63","\n","$L64","\n","$L65","\n","$L66","\n","$L67","\n","$L68","\n","$L69","\n","$L6a","\n","$L6b","\n","$L6c","\n","$L6d","\n","$L6e","\n","$L6f","\n","$L70","\n","$L71"]}]
+2d:["$","span","span-3",{"style":{"color":"#032F62"},"children":"\"$set\""}]
+2e:["$","span","span-4",{"style":{"color":"#24292E"},"children":": {"}]
+2f:["$","span","span-5",{"data-line":"","children":[["$","span","span-0",{"style":{"color":"#032F62"},"children":"    \"last_login\""}],["$","span","span-1",{"style":{"color":"#24292E"},"children":": now,"}]]}]
+30:["$","span","span-6",{"data-line":"","children":[["$","span","span-0",{"style":{"color":"#032F62"},"children":"    \"view_count\""}],["$","span","span-1",{"style":{"color":"#24292E"},"children":": cnt,"}]]}]
+31:["$","span","span-7",{"data-line":"","children":[["$","span","span-0",{"style":{"color":"#032F62"},"children":"    \"counter\""}],["$","span","span-1",{"style":{"color":"#24292E"},"children":": val,"}]]}]
+32:["$","span","span-8",{"data-line":"","children":["$","span","span-0",{"style":{"color":"#24292E"},"children":"}})"}]}]
+33:["$","blockquote","blockquote-0",{"children":["\n",["$","p","p-0",{"children":[["$","strong","strong-0",{"children":"버전 주의"}],": 이 실험은 MongoDB 7.0 기준입니다. 8.0에서는 동작이 달라지는 항목이 두 가지 있습니다. 실험 결과 이후에 정리했습니다."]}],"\n"]}]
+34:["$","hr","hr-3",{}]
+35:["$","h2","h2-2",{"id":"실측-결과","children":"실측 결과"}]
+36:["$","h3","h3-0",{"id":"throughput-opss","children":"Throughput (ops/s)"}]
+37:["$","table","table-0",{"children":[["$","thead","thead-0",{"children":["$","tr","tr-0",{"children":[["$","th","th-0",{"children":"workers"}],["$","th","th-1",{"children":"Full Replace"}],["$","th","th-2",{"children":"$$set partial"}],["$","th","th-3",{"children":"$$set 이점"}]]}]}],["$","tbody","tbody-0",{"children":[["$","tr","tr-0",{"children":[["$","td","td-0",{"children":"4"}],["$","td","td-1",{"children":"8,407"}],["$","td","td-2",{"children":"12,664"}],["$","td","td-3",{"children":["$","strong","strong-0",{"children":"+51%"}]}]]}],["$","tr","tr-1",{"children":[["$","td","td-0",{"children":"16"}],["$","td","td-1",{"children":"9,298"}],["$","td","td-2",{"children":"11,423"}],["$","td","td-3",{"children":"+23%"}]]}],["$","tr","tr-2",{"children":[["$","td","td-0",{"children":"64"}],["$","td","td-1",{"children":"8,191"}],["$","td","td-2",{"children":"11,548"}],["$","td","td-3",{"children":"+41%"}]]}],["$","tr","tr-3",{"children":[["$","td","td-0",{"children":"128"}],["$","td","td-1",{"children":"8,639"}],["$","td","td-2",{"children":"10,562"}],["$","td","td-3",{"children":"+22%"}]]}],["$","tr","tr-4",{"children":[["$","td","td-0",{"children":"256"}],["$","td","td-1",{"children":"6,832"}],["$","td","td-2",{"children":"8,897"}],["$","td","td-3",{"children":["$","strong","strong-0",{"children":"+30%"}]}]]}]]}]]}]
+38:["$","p","p-10",{"children":["$$set이 전 구간에서 22~51% 빠릅니다. workers=256에서 Full Replace는 workers=16 대비 ",["$","strong","strong-0",{"children":"26% 하락"}],"하지만 $set은 ",["$","strong","strong-1",{"children":"22% 하락"}],"에 그칩니다. 부하가 높을수록 격차가 벌어집니다."]}]
+39:["$","h3","h3-1",{"id":"wiredtiger-dirty-bytes-peak-262-mb-기준-","children":"WiredTiger Dirty Bytes Peak (262 MB 기준 %)"}]
+3a:["$","table","table-1",{"children":[["$","thead","thead-0",{"children":["$","tr","tr-0",{"children":[["$","th","th-0",{"children":"workers"}],["$","th","th-1",{"children":"Full Replace"}],["$","th","th-2",{"children":"$$set partial"}]]}]}],["$","tbody","tbody-0",{"children":[["$","tr","tr-0",{"children":[["$","td","td-0",{"children":"4"}],["$","td","td-1",{"children":["$","strong","strong-0",{"children":"333% [OVERFLOW]"}]}],["$","td","td-2",{"children":"102%"}]]}],["$","tr","tr-1",{"children":[["$","td","td-0",{"children":"16"}],["$","td","td-1",{"children":["$","strong","strong-0",{"children":"315% [OVERFLOW]"}]}],["$","td","td-2",{"children":"100%"}]]}],["$","tr","tr-2",{"children":[["$","td","td-0",{"children":"64"}],["$","td","td-1",{"children":["$","strong","strong-0",{"children":"360% [OVERFLOW]"}]}],["$","td","td-2",{"children":"98%"}]]}],["$","tr","tr-3",{"children":[["$","td","td-0",{"children":"128"}],["$","td","td-1",{"children":["$","strong","strong-0",{"children":"335% [OVERFLOW]"}]}],["$","td","td-2",{"children":"101%"}]]}],["$","tr","tr-4",{"children":[["$","td","td-0",{"children":"256"}],["$","td","td-1",{"children":["$","strong","strong-0",{"children":"355% [OVERFLOW]"}]}],["$","td","td-2",{"children":"101%"}]]}]]}]]}]
+3b:["$","p","p-11",{"children":["Full Replace는 ",["$","strong","strong-0",{"children":"모든 부하 단계에서"}]," 설정 cache의 3~3.6배를 초과합니다. $set은 262 MB 경계선 수준에서 안정적으로 유지됩니다."]}]
+3c:["$","h3","h3-2",{"id":"write-queue-peak-write-ticket-경합-지표","children":"Write Queue Peak (write ticket 경합 지표)"}]
+3d:["$","table","table-2",{"children":[["$","thead","thead-0",{"children":["$","tr","tr-0",{"children":[["$","th","th-0",{"children":"workers"}],["$","th","th-1",{"children":"Full Replace"}],["$","th","th-2",{"children":"$$set partial"}]]}]}],["$","tbody","tbody-0",{"children":[["$","tr","tr-0",{"children":[["$","td","td-0",{"children":"4"}],["$","td","td-1",{"children":"0"}],["$","td","td-2",{"children":"0"}]]}],["$","tr","tr-1",{"children":[["$","td","td-0",{"children":"16"}],["$","td","td-1",{"children":"5"}],["$","td","td-2",{"children":"0"}]]}],["$","tr","tr-2",{"children":[["$","td","td-0",{"children":"64"}],["$","td","td-1",{"children":["$","strong","strong-0",{"children":"53"}]}],["$","td","td-2",{"children":"0"}]]}],["$","tr","tr-3",{"children":[["$","td","td-0",{"children":"128"}],["$","td","td-1",{"children":"0"}],["$","td","td-2",{"children":"66"}]]}],["$","tr","tr-4",{"children":[["$","td","td-0",{"children":"256"}],["$","td","td-1",{"children":["$","strong","strong-0",{"children":"173"}]}],["$","td","td-2",{"children":"0"}]]}]]}]]}]
+3e:["$","p","p-12",{"children":"Full Replace에서 workers=64부터 write queue가 폭발합니다. workers=256에서 173. $set은 전 구간 0을 유지합니다 (workers=128의 66은 측정 노이즈로 분류)."}]
+3f:["$","hr","hr-4",{}]
+40:["$","h2","h2-3",{"id":"예측-1이-빗나간-이유-dirty-bytes-33x--19x","children":"예측 1이 빗나간 이유: dirty bytes 33x → 1.9x"}]
+41:["$","p","p-13",{"children":["예측은 \"100KB vs 3KB = 33배 차이\"였습니다. 실측은 ",["$","strong","strong-0",{"children":"1.9배"}],"였습니다."]}]
+42:["$","p","p-14",{"children":["이유는 WiredTiger가 dirty 상태를 ",["$","strong","strong-0",{"children":"page 단위"}],"로 추적하기 때문입니다."]}]
+43:["$","pre","pre-1",{"children":["$","code","code-0",{"children":"WiredTiger dirty tracking:\n\nFull Replace:  100KB page dirty\n$set partial:  100KB page dirty (같은 page!)\n\n두 방식 모두 동일한 100KB page를 dirty로 만든다.\npage cost = 동일\n\n추가 비용:\n  Full Replace: 100KB update chain\n  $set:         ~3KB delta\n\n총 비용 비율 = (100KB + 100KB) / (100KB + 3KB) ≈ 1.9×\n"}]}]
+44:["$","p","p-15",{"children":["100KB 문서를 수정하면 어떤 방법으로 수정하든 그 page(100KB)가 dirty가 됩니다. ",["$","code","code-0",{"children":"$$set"}],"으로 3개 필드만 바꿔도 dirty page 비용은 100KB입니다. 따라서 비율은 33배가 아닌 1.9배입니다."]}]
+45:["$","p","p-16",{"children":["그런데도 Full Replace의 throughput이 22~51% 낮은 이유가 있습니다. 절대 수치가 다릅니다. Full Replace dirty bytes 평균 442 MB(262MB 기준 169%)는 cache를 넘어 ",["$","strong","strong-0",{"children":"application thread eviction"}],"을 유발합니다. 이 eviction이 write ticket을 소비하고 write queue를 키웁니다. 비율은 1.9배지만 Full Replace는 항상 한계선을 넘어, $set은 항상 한계선 아래에 머무릅니다."]}]
+46:["$","p","p-17",{"children":"혹시 \"dirty bytes 비율이 1.9배면 큰 차이 아닌 것 아닌가?\"라고 생각하셨나요? 수치가 작아 보여도, Full Replace가 항상 300%를 초과하고 $set이 항상 100%에 머문다면 WiredTiger가 경험하는 스트레스는 완전히 다릅니다."}]
+47:["$","hr","hr-5",{}]
+48:["$","h2","h2-4",{"id":"예측-2가-더-크게-빗나간-이유-oplog-33x--175x","children":"예측 2가 더 크게 빗나간 이유: oplog 33x → 175x"}]
+49:["$","p","p-18",{"children":"oplog는 MongoDB가 복제를 위해 기록하는 변경 로그입니다. secondary 노드가 oplog를 읽어 데이터를 동기화합니다. oplog 크기는 secondary lag, 복제 대역폭, 디스크 write throughput 모두에 직접 영향을 줍니다."}]
+4a:["$","pre","pre-2",{"children":["$","code","code-0",{"children":"Full Replace oplog entry: 100,992 bytes (98.6 KB)\n$set oplog entry:             575 bytes  (0.6 KB)\n비율: 175x   (예측: 33x)\n"}]}]
+4b:["$","p","p-19",{"children":["예측이 5배 이상 빗나간 이유가 있습니다. Full Replace는 oplog에 ",["$","strong","strong-0",{"children":"문서 전체를 JSON으로 직렬화"}],"해서 씁니다. 100KB 문서가 그대로 oplog entry에 들어갑니다. ",["$","code","code-0",{"children":"$$set"}],"은 변경된 필드 3개의 diff만 씁니다."]}]
+4c:["$","h3","h3-3",{"id":"oplog는-설정-크기를-초과해서-성장합니다-mongodb-40","children":"oplog는 설정 크기를 초과해서 성장합니다 (MongoDB 4.0+)"}]
+4d:["$","p","p-20",{"children":"혹시 \"oplog 크기를 제한하면 디스크 걱정 없다\"고 생각하고 계신가요? MongoDB 4.0부터 oplog는 configured size를 넘어서 성장할 수 있습니다."}]
+4e:["$","p","p-21",{"children":"공식 문서의 설명입니다."}]
+4f:["$","blockquote","blockquote-1",{"children":["\n",["$","p","p-0",{"children":[["$","em","em-0",{"children":"\"Unlike other capped collections, the oplog can grow past its configured size limit to avoid deleting the majority commit point.\""}],"\n— MongoDB Replica Set Oplog"]}],"\n"]}]
+50:["$","p","p-22",{"children":"majority commit point가 뒤처지면 oplog를 truncate하지 않고 디스크를 더 씁니다. Full Replace의 175x oplog가 복제 lag을 유발하면, oplog는 configured size를 넘어 bloat됩니다. \"Oplog 윈도우가 줄어든다\"보다 \"Oplog 디스크가 폭증한다\"가 더 정확한 표현입니다."}]
+51:["$","hr","hr-6",{}]
+52:["$","h2","h2-5",{"id":"wiredtiger-cache가-동적으로-확장됐습니다","children":"WiredTiger cache가 동적으로 확장됐습니다"}]
+53:["$","p","p-23",{"children":["실험 중 흥미로운 현상이 있었습니다. 설정값은 262 MB였는데, 실험 중 ",["$","code","code-0",{"children":"maximum bytes configured"}]," 필드가 ",["$","strong","strong-0",{"children":"8.5 GB"}],"(Docker VM RAM 한도)로 자동 확장됐습니다."]}]
+54:["$","p","p-24",{"children":"Full Replace의 dirty bytes(평균 442 MB)가 설정 cache(262 MB)를 초과하자 WiredTiger가 OS 메모리 한도까지 cache를 늘린 것입니다. 이 동적 확장이 없었다면 OOM이나 더 극단적인 성능 저하가 발생했을 것입니다. $set의 dirty bytes(평균 238 MB)는 설정 내에서 안정적으로 운용됐습니다."}]
+55:["$","hr","hr-7",{}]
+56:["$","h2","h2-6",{"id":"실무-시사점","children":"실무 시사점"}]
+57:["$","figure","figure-1",{"data-rehype-pretty-code-figure":"","children":["$","pre","pre-0",{"style":{"backgroundColor":"#fff","color":"#24292e"},"tabIndex":0,"data-language":"python","data-theme":"github-light","children":["$","code","code-0",{"data-language":"python","data-theme":"github-light","style":{"display":"grid"},"children":[["$","span","span-0",{"data-line":"","children":["$","span","span-0",{"style":{"color":"#6A737D"},"children":"# 나쁜 예: ODM save() 주의 — 일부 구현이 full replace를 씀"}]}],"\n",["$","span","span-1",{"data-line":"","children":[["$","span","span-0",{"style":{"color":"#24292E"},"children":"coll.replace_one({"}],["$","span","span-1",{"style":{"color":"#032F62"},"children":"\"_id\""}],["$","span","span-2",{"style":{"color":"#24292E"},"children":": uid}, user_doc)"}]]}],"\n",["$","span","span-2",{"data-line":"","children":" "}],"\n",["$","span","span-3",{"data-line":"","children":["$","span","span-0",{"style":{"color":"#6A737D"},"children":"# 좋은 예: 변경된 필드만 지정"}]}],"\n",["$","span","span-4",{"data-line":"","children":[["$","span","span-0",{"style":{"color":"#24292E"},"children":"coll.update_one({"}],["$","span","span-1",{"style":{"color":"#032F62"},"children":"\"_id\""}],["$","span","span-2",{"style":{"color":"#24292E"},"children":": uid}, {"}],["$","span","span-3",{"style":{"color":"#032F62"},"children":"\"$set\""}],["$","span","span-4",{"style":{"color":"#24292E"},"children":": {"}]]}],"\n",["$","span","span-5",{"data-line":"","children":[["$","span","span-0",{"style":{"color":"#032F62"},"children":"    \"last_login\""}],["$","span","span-1",{"style":{"color":"#24292E"},"children":": now,"}]]}],"\n",["$","span","span-6",{"data-line":"","children":[["$","span","span-0",{"style":{"color":"#032F62"},"children":"    \"view_count\""}],["$","span","span-1",{"style":{"color":"#24292E"},"children":": cnt,"}]]}],"\n",["$","span","span-7",{"data-line":"","children":[["$","span","span-0",{"style":{"color":"#032F62"},"children":"    \"counter\""}],["$","span","span-1",{"style":{"color":"#24292E"},"children":": val,"}]]}],"\n",["$","span","span-8",{"data-line":"","children":["$","span","span-0",{"style":{"color":"#24292E"},"children":"}})"}]}]]}]}]}]
+58:["$","p","p-25",{"children":["ORM/ODM을 쓰고 있다면 내부 구현을 확인하세요. **Spring Data MongoDB의 ",["$","code","code-0",{"children":"save()"}],"는 ",["$","code","code-1",{"children":"replaceOne"}],", ",["$","code","code-2",{"children":"updateFirst()"}]," + ",["$","code","code-3",{"children":"Update"}],"는 partial ",["$","code","code-4",{"children":"$$set"}],"**입니다. Mongoose의 ",["$","code","code-5",{"children":"save()"}],"는 기본적으로 dirty field만 전송하지만 ",["$","code","code-6",{"children":"overwrite: true"}]," 옵션 시 full replace가 됩니다."]}]
+59:["$","p","p-26",{"children":"지금 운영 중인 코드가 replaceOne을 쓰는지 확인하는 가장 빠른 방법은 oplog를 한 번 들여다보는 것입니다. 100KB짜리 oplog entry가 보인다면 Full Replace가 쓰이고 있다는 신호입니다."}]
+5a:["$","h3","h3-4",{"id":"모니터링-알람-기준","children":"모니터링 알람 기준"}]
+5b:["$","pre","pre-3",{"children":["$","code","code-0",{"children":"cache: tracked dirty bytes / maximum bytes configured > 80%  → warning\nglobalLock.currentQueue.writers > 20                          → alert\ncache: pages evicted by application threads delta > 1/sec     → critical\n"}]}]
+5c:["$","hr","hr-8",{}]
+5d:["$","h2","h2-7",{"id":"mongodb-80에서-달라지는-두-가지","children":"MongoDB 8.0에서 달라지는 두 가지"}]
+5e:["$","p","p-27",{"children":"이 실험은 MongoDB 7.0 기준입니다. 8.0에서 두 가지 동작이 바뀌어서 재현 시 주의가 필요합니다."}]
+5f:["$","h3","h3-5",{"id":"1-writerapplier-thread-분리--측정-지표가-바뀌었습니다","children":"1. writer/applier thread 분리 → 측정 지표가 바뀌었습니다"}]
+60:["$","p","p-28",{"children":"8.0부터 secondary가 oplog batch를 writer thread(수신)와 applier thread(적용)로 나눠서 병렬 처리합니다. 이에 따라 복제 모니터링 지표가 구식/신식으로 분리됐습니다."}]
+61:["$","table","table-3",{"children":[["$","thead","thead-0",{"children":["$","tr","tr-0",{"children":[["$","th","th-0",{}],["$","th","th-1",{"children":"7.0 이하"}],["$","th","th-2",{"children":"8.0+"}]]}]}],["$","tbody","tbody-0",{"children":["$","tr","tr-0",{"children":[["$","td","td-0",{"children":"복제 버퍼 지표"}],["$","td","td-1",{"children":[["$","code","code-0",{"children":"metrics.repl.buffer.*"}]," (단일)"]}],["$","td","td-2",{"children":[["$","code","code-0",{"children":"metrics.repl.buffer.apply.*"}]," + ",["$","code","code-1",{"children":"metrics.repl.buffer.write.*"}]," (분리)"]}]]}]}]]}]
+62:["$","p","p-29",{"children":["8.0 환경에서 복제 lag을 모니터링할 때는 ",["$","code","code-0",{"children":"metrics.repl.buffer.apply.sizeBytes"}],"를 확인하세요. write buffer는 안정한데 apply buffer가 쌓이면 secondary applier 단계가 병목입니다."]}]
+63:["$","h3","h3-6",{"id":"2-wmajority가-더-일찍-반환됩니다","children":"2. w:majority가 더 일찍 반환됩니다"}]
+64:["$","p","p-30",{"children":["7.0에서 ",["$","code","code-0",{"children":"w:\"majority\""}]," write concern은 secondary가 변경 사항을 **적용(applied)**할 때 반환했습니다. 8.0부터는 secondary가 oplog entry를 **수신(wrote)**할 때 반환합니다."]}]
+65:["$","pre","pre-4",{"children":["$","code","code-0",{"children":"7.0: commit 반환 = secondary가 변경 적용 완료\n8.0: commit 반환 = secondary가 oplog entry 수신 완료 (적용은 진행 중일 수 있음)\n"}]}]
+66:["$","p","p-31",{"children":"8.0 환경에서 commit 직후 secondary lag을 측정하면 7.0보다 lag이 남아있을 수 있습니다. 두 버전의 결과를 직접 비교하면 안 됩니다."}]
+67:["$","hr","hr-9",{}]
+68:["$","h2","h2-8",{"id":"두-예측이-다른-방향으로-빗나간-이유","children":"두 예측이 다른 방향으로 빗나간 이유"}]
+69:["$","p","p-32",{"children":"같은 \"100KB vs 3KB\"에서 출발한 예측이 반대 방향으로 틀렸습니다."}]
+6a:["$","ul","ul-0",{"children":["\n",["$","li","li-0",{"children":[["$","strong","strong-0",{"children":"dirty bytes"}],": page-level tracking → 두 방식이 같은 page를 dirty → 실제보다 작게 예측"]}],"\n",["$","li","li-1",{"children":[["$","strong","strong-0",{"children":"oplog"}],": document-level serialization → full document 직렬화 → 실제보다 크게 예측"]}],"\n"]}]
+6b:["$","p","p-33",{"children":"WiredTiger의 내부 동작을 두 레이어로 분리해서 이해해야 합니다. 메모리(dirty tracking)는 page 단위, 복제(oplog)는 document 단위입니다. 같은 연산이 레이어마다 다른 비용 구조를 가집니다."}]
+6c:["$","p","p-34",{"children":"replaceOne을 쓰는 코드가 있다면 당장 바꾸는 것보다 먼저 oplog 크기와 dirty bytes 압력을 측정해보는 게 우선입니다. 어떤 문서를 얼마나 자주 교체하는지에 따라 영향 범위가 완전히 달라집니다."}]
+6d:["$","hr","hr-10",{}]
+6e:["$","h2","h2-9",{"id":"재현-방법","children":"재현 방법"}]
+6f:["$","figure","figure-2",{"data-rehype-pretty-code-figure":"","children":["$","pre","pre-0",{"style":{"backgroundColor":"#fff","color":"#24292e"},"tabIndex":0,"data-language":"bash","data-theme":"github-light","children":["$","code","code-0",{"data-language":"bash","data-theme":"github-light","style":{"display":"grid"},"children":[["$","span","span-0",{"data-line":"","children":[["$","span","span-0",{"style":{"color":"#6F42C1"},"children":"docker"}],["$","span","span-1",{"style":{"color":"#032F62"},"children":" compose"}],["$","span","span-2",{"style":{"color":"#032F62"},"children":" up"}],["$","span","span-3",{"style":{"color":"#005CC5"},"children":" -d"}]]}],"\n",["$","span","span-1",{"data-line":"","children":[["$","span","span-0",{"style":{"color":"#6F42C1"},"children":"docker"}],["$","span","span-1",{"style":{"color":"#032F62"},"children":" exec"}],["$","span","span-2",{"style":{"color":"#032F62"},"children":" cliff-mongo"}],["$","span","span-3",{"style":{"color":"#032F62"},"children":" mongosh"}],["$","span","span-4",{"style":{"color":"#005CC5"},"children":" --eval"}],["$","span","span-5",{"style":{"color":"#005CC5"},"children":" \\"}]]}],"\n",["$","span","span-2",{"data-line":"","children":["$","span","span-0",{"style":{"color":"#032F62"},"children":"  'rs.initiate({_id:\"rs0\",members:[{_id:0,host:\"localhost:27017\"}]})'"}]}],"\n",["$","span","span-3",{"data-line":"","children":[["$","span","span-0",{"style":{"color":"#6F42C1"},"children":"sleep"}],["$","span","span-1",{"style":{"color":"#005CC5"},"children":" 5"}]]}],"\n",["$","span","span-4",{"data-line":"","children":[["$","span","span-0",{"style":{"color":"#6F42C1"},"children":"pip"}],["$","span","span-1",{"style":{"color":"#032F62"},"children":" install"}],["$","span","span-2",{"style":{"color":"#032F62"},"children":" pymongo"}]]}],"\n",["$","span","span-5",{"data-line":"","children":[["$","span","span-0",{"style":{"color":"#6F42C1"},"children":"python3"}],["$","span","span-1",{"style":{"color":"#032F62"},"children":" seed.py"}]]}],"\n",["$","span","span-6",{"data-line":"","children":[["$","span","span-0",{"style":{"color":"#6F42C1"},"children":"bash"}],["$","span","span-1",{"style":{"color":"#032F62"},"children":" run_ladder.sh"}]]}],"\n",["$","span","span-7",{"data-line":"","children":[["$","span","span-0",{"style":{"color":"#6F42C1"},"children":"python3"}],["$","span","span-1",{"style":{"color":"#032F62"},"children":" analyze.py"}]]}]]}]}]}]
+70:["$","blockquote","blockquote-2",{"children":["\n",["$","p","p-0",{"children":[["$","strong","strong-0",{"children":"재현 시 버전 고정 권장"}],": MongoDB 7.0과 8.0은 복제 동작과 측정 지표가 다릅니다. 원 실험과 비교하려면 ",["$","code","code-0",{"children":"image: mongo:7.0"}],"으로 고정하세요."]}],"\n"]}]
+71:["$","p","p-35",{"children":["실험 코드: ",["$","a","a-0",{"href":"https://github.com/kmando01/mongodb-write-cliff-bench","children":"kmando01/mongodb-write-cliff-bench"}]]}]
