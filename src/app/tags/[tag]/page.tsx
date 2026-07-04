@@ -9,7 +9,8 @@ export function generateStaticParams() {
 }
 
 export default async function TagPage({ params }: { params: Promise<{ tag: string }> }) {
-  const { tag } = await params;
+  const { tag: rawTag } = await params;
+  const tag = decodeURIComponent(rawTag);
   const posts = getPublishedPosts(getAllPosts());
   const matched = getPostsByTag(posts, tag).sort((a, b) =>
     a.date > b.date ? -1 : a.date < b.date ? 1 : 0
