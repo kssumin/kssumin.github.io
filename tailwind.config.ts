@@ -2,27 +2,28 @@ import type { Config } from 'tailwindcss';
 
 const config: Config = {
   content: ['./src/**/*.{ts,tsx}'],
+  darkMode: 'class',
   theme: {
     extend: {
       colors: {
         ink: {
-          0: '#ffffff',
-          50: '#fafafa',
-          100: '#f4f4f4',
-          200: '#e8e8e8',
-          300: '#d4d4d4',
-          400: '#a3a3a3',
-          500: '#737373',
-          600: '#525252',
-          700: '#404040',
-          800: '#262626',
-          900: '#171717',
-          950: '#0a0a0a',
+          0: 'var(--ink-0)',
+          50: 'var(--ink-50)',
+          100: 'var(--ink-100)',
+          200: 'var(--ink-200)',
+          300: 'var(--ink-300)',
+          400: 'var(--ink-400)',
+          500: 'var(--ink-500)',
+          600: 'var(--ink-600)',
+          700: 'var(--ink-700)',
+          800: 'var(--ink-800)',
+          900: 'var(--ink-900)',
+          950: 'var(--ink-950)',
         },
         blue: {
-          50: '#e8eeff',
-          600: '#2c5eff',
-          800: '#1f43c2',
+          50: 'var(--blue-50)',
+          600: 'var(--blue-600)',
+          800: 'var(--blue-800)',
         },
       },
       fontFamily: {
@@ -48,6 +49,8 @@ const config: Config = {
         's-6': '32px',
         's-7': '48px',
         's-8': '64px',
+        's-9': '88px',
+        's-10': '128px',
       },
       maxWidth: {
         reading: '720px',

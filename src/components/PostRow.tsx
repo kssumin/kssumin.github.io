@@ -7,7 +7,7 @@ export function PostRow({ post, showEpisode = true }: { post: PostMeta; showEpis
   return (
     <Link
       href={`/posts/${post.slug}/`}
-      className="grid grid-cols-[64px_1fr] gap-s-4 py-s-4 hairline group"
+      className="grid grid-cols-[64px_1fr] gap-s-5 py-s-5 hairline group"
     >
       <div className="eyebrow pt-1">{episode}</div>
       <div>

@@ -13,7 +13,7 @@ export default function HomePage() {
       {groups.map((group, index) => (
         <section
           key={group.series ?? group.posts[0].slug}
-          className={index === 0 ? '' : 'mt-s-7'}
+          className={index === 0 ? '' : 'mt-s-9'}
         >
           <SeriesHeader series={group.series} count={group.posts.length} />
           <div>
