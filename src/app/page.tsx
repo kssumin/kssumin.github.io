@@ -7,7 +7,7 @@ export default function HomePage() {
   const groups = groupPostsBySeries(posts);
 
   return (
-    <main>
+    <main className="max-w-reading">
       <h1 className="text-h1 mb-s-8">기술 블로그</h1>
 
       {groups.map((group, index) => (

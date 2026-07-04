@@ -19,7 +19,7 @@ export default async function TagPage({ params }: { params: Promise<{ tag: strin
   if (matched.length === 0) notFound();
 
   return (
-    <main>
+    <main className="max-w-reading">
       <Link href="/" className="text-sm text-ink-500 hover:underline">
         ← 목록으로
       </Link>
