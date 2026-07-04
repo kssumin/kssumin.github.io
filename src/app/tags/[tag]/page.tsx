@@ -5,7 +5,17 @@ import { PostRow } from '@/components/PostRow';
 
 export function generateStaticParams() {
   const posts = getPublishedPosts(getAllPosts());
-  return getAllTags(posts).map((tag) => ({ tag }));
+  const tags = getAllTags(posts);
+  // `output: 'export'` hard-fails the build if a dynamic route's
+  // generateStaticParams() returns an empty array (Next.js treats it the same
+  // as "missing generateStaticParams()" — see
+  // https://nextjs.org/docs/messages/empty-generate-static-params and
+  // https://github.com/vercel/next.js/issues/71862, both unresolved as of
+  // Next 15). When there are zero published posts (or none with tags), there
+  // are legitimately zero valid tag pages. Emit one placeholder param so the
+  // build passes; the page component below 404s for it since no real post
+  // will ever have this tag.
+  return tags.length > 0 ? tags.map((tag) => ({ tag })) : [{ tag: '__placeholder__' }];
 }
 
 export default async function TagPage({ params }: { params: Promise<{ tag: string }> }) {

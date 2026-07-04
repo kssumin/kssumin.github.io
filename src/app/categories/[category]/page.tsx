@@ -5,7 +5,15 @@ import { PostRow } from '@/components/PostRow';
 
 export function generateStaticParams() {
   const posts = getPublishedPosts(getAllPosts());
-  return getAllCategories(posts).map((category) => ({ category }));
+  const categories = getAllCategories(posts);
+  // See the identical guard in src/app/tags/[tag]/page.tsx for why this is
+  // necessary: `output: 'export'` hard-fails the build when a dynamic route's
+  // generateStaticParams() returns an empty array. With zero published posts
+  // there are legitimately zero valid category pages, so emit one
+  // placeholder param; the page component 404s for it below.
+  return categories.length > 0
+    ? categories.map((category) => ({ category }))
+    : [{ category: '__placeholder__' }];
 }
 
 export default async function CategoryPage({

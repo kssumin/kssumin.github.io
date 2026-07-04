@@ -8,7 +8,16 @@ import { TagChip } from '@/components/TagChip';
 import { CategoryChip } from '@/components/CategoryChip';
 
 export function generateStaticParams() {
-  return getPublishedPosts(getAllPosts()).map((post) => ({ slug: post.slug }));
+  const posts = getPublishedPosts(getAllPosts());
+  // See the identical guard in src/app/tags/[tag]/page.tsx for why this is
+  // necessary: `output: 'export'` hard-fails the build when a dynamic route's
+  // generateStaticParams() returns an empty array. With zero published posts
+  // there are legitimately zero post pages, so emit one placeholder slug;
+  // getPostBySlug() below throws for it (no such file), which is caught and
+  // rendered as 404.
+  return posts.length > 0
+    ? posts.map((post) => ({ slug: post.slug }))
+    : [{ slug: '__placeholder__' }];
 }
 
 export default async function PostPage({ params }: { params: Promise<{ slug: string }> }) {
