@@ -11,6 +11,7 @@ export function PostRow({ post, showEpisode = true }: { post: PostMeta; showEpis
     >
       <div className="eyebrow pt-1">{episode}</div>
       <div>
+        <div className="eyebrow text-ink-400 mb-1">{post.category}</div>
         <h3 className="text-h3 group-hover:text-blue-600 transition-colors mb-1">
           {post.title}
         </h3>

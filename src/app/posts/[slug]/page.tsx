@@ -3,6 +3,7 @@ import { notFound } from 'next/navigation';
 import { getAllPosts, getPostBySlug, getAdjacentPosts, getPublishedPosts } from '@/lib/posts';
 import { MarkdownRenderer } from '@/components/MarkdownRenderer';
 import { TagChip } from '@/components/TagChip';
+import { CategoryChip } from '@/components/CategoryChip';
 
 export function generateStaticParams() {
   return getPublishedPosts(getAllPosts()).map((post) => ({ slug: post.slug }));
@@ -27,7 +28,10 @@ export default async function PostPage({ params }: { params: Promise<{ slug: str
         ← 목록으로
       </Link>
 
-      {post.series && <div className="eyebrow text-blue-600 mt-s-6">{post.series}</div>}
+      <div className="mt-s-6">
+        <CategoryChip category={post.category} />
+      </div>
+      {post.series && <div className="eyebrow text-blue-600 mt-1">{post.series}</div>}
       <h1 className="text-h1 mt-2 mb-s-6">{post.title}</h1>
       {post.description && (
         <p className="text-lead text-ink-500 mb-s-7">{post.description}</p>

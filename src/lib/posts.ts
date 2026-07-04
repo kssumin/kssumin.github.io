@@ -12,6 +12,7 @@ export interface PostMeta {
   order: number;
   date: string;
   tags: string[];
+  category: string;
   draft: boolean;
 }
 
@@ -46,6 +47,7 @@ function readPostFile(filename: string): Post {
     order: data.order ?? 0,
     date: data.date,
     tags: data.tags ?? [],
+    category: data.category ?? '실험로그',
     draft: data.draft ?? false,
     content: bodyWithoutLeadingH1,
   };
@@ -133,4 +135,14 @@ export function getPostsByTag(posts: PostMeta[], tag: string): PostMeta[] {
 
 export function getPublishedPosts(posts: PostMeta[]): PostMeta[] {
   return posts.filter((p) => !p.draft);
+}
+
+export function getAllCategories(posts: PostMeta[]): string[] {
+  const categories = new Set<string>();
+  for (const p of posts) categories.add(p.category);
+  return [...categories];
+}
+
+export function getPostsByCategory(posts: PostMeta[], category: string): PostMeta[] {
+  return posts.filter((p) => p.category === category);
 }

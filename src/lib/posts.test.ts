@@ -4,6 +4,8 @@ import {
   getAdjacentPosts,
   getAllTags,
   getPostsByTag,
+  getAllCategories,
+  getPostsByCategory,
   getPublishedPosts,
   type PostMeta,
 } from './posts';
@@ -16,6 +18,7 @@ const post = (overrides: Partial<PostMeta>): PostMeta => ({
   order: 0,
   date: '2026-01-01',
   tags: [],
+  category: '실험로그',
   draft: false,
   ...overrides,
 });
@@ -96,6 +99,27 @@ describe('tags', () => {
 
   it('존재하지 않는 태그는 빈 배열을 반환한다', () => {
     expect(getPostsByTag(posts, 'Kotlin')).toEqual([]);
+  });
+});
+
+describe('categories', () => {
+  const posts = [
+    post({ slug: 'a', category: '실험로그' }),
+    post({ slug: 'b', category: '독서노트' }),
+    post({ slug: 'c', category: '실험로그' }),
+  ];
+
+  it('getAllCategories는 중복 없이 등장한 모든 카테고리를 반환한다', () => {
+    expect(getAllCategories(posts).sort()).toEqual(['독서노트', '실험로그']);
+  });
+
+  it('getPostsByCategory는 해당 카테고리를 가진 글만 반환한다', () => {
+    const result = getPostsByCategory(posts, '실험로그');
+    expect(result.map((p) => p.slug).sort()).toEqual(['a', 'c']);
+  });
+
+  it('존재하지 않는 카테고리는 빈 배열을 반환한다', () => {
+    expect(getPostsByCategory(posts, '학습정리')).toEqual([]);
   });
 });
 
