@@ -31,6 +31,12 @@ function readPostFile(filename: string): Post {
     throw new Error(`Post ${filename} is missing a valid "date" in frontmatter`);
   }
 
+  // The frontmatter `title` is the single source of truth for the page title,
+  // which is rendered separately as a styled <h1>. Strip the redundant leading
+  // "# Title" heading (left over from Task 4's migration) from the markdown
+  // body so it isn't rendered a second time by MarkdownRenderer.
+  const bodyWithoutLeadingH1 = content.replace(/^\s*#\s+.+\n+/, '');
+
   return {
     slug,
     title: data.title,
@@ -39,7 +45,7 @@ function readPostFile(filename: string): Post {
     order: data.order ?? 0,
     date: data.date,
     tags: data.tags ?? [],
-    content,
+    content: bodyWithoutLeadingH1,
   };
 }
 
