@@ -5,11 +5,25 @@ import remarkRehype from 'remark-rehype';
 import rehypePrettyCode from 'rehype-pretty-code';
 import rehypeReact from 'rehype-react';
 import * as prod from 'react/jsx-runtime';
+import { visit } from 'unist-util-visit';
+import type { Root } from 'mdast';
+
+function remarkRewritePostLinks() {
+  return (tree: Root) => {
+    visit(tree, 'link', (node) => {
+      const match = /^\.\/([\w-]+)\.md$/.exec(node.url);
+      if (match) {
+        node.url = `/posts/${match[1]}/`;
+      }
+    });
+  };
+}
 
 export async function MarkdownRenderer({ content }: { content: string }) {
   const file = await unified()
     .use(remarkParse)
     .use(remarkGfm)
+    .use(remarkRewritePostLinks)
     .use(remarkRehype)
     .use(rehypePrettyCode, { theme: 'github-light' })
     .use(rehypeReact, {
