@@ -1,0 +1,39 @@
+@import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendard-variable.min.css');
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --font-sans: 'Pretendard Variable', 'Pretendard', -apple-system, BlinkMacSystemFont,
+    'Apple SD Gothic Neo', 'Noto Sans KR', sans-serif;
+  --font-mono: 'JetBrains Mono', 'SF Mono', ui-monospace, Menlo, monospace;
+}
+
+@layer base {
+  html {
+    font-family: var(--font-sans);
+    font-size: 18px;
+    color: theme('colors.ink.950');
+    background-color: theme('colors.ink.0');
+    letter-spacing: -0.01em;
+    -webkit-font-smoothing: antialiased;
+  }
+}
+
+@layer utilities {
+  .eyebrow {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: theme('colors.ink.500');
+  }
+  .section-rule {
+    border-top: 1px solid theme('colors.ink.950');
+  }
+  .hairline {
+    border-top: 1px solid theme('colors.ink.200');
+  }
+}
