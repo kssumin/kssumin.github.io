@@ -3,6 +3,8 @@ import type { Metadata } from 'next';
 import type { ReactNode } from 'react';
 import { ThemeToggle } from '@/components/ThemeToggle';
 import { Sidebar } from '@/components/Sidebar';
+import { SidebarShell } from '@/components/SidebarShell';
+import { SidebarToggle } from '@/components/SidebarToggle';
 
 export const metadata: Metadata = {
   title: 'kmando blog',
@@ -33,13 +35,14 @@ export default function RootLayout({ children }: { children: ReactNode }) {
       </head>
       <body>
         <div className="mx-auto max-w-[1200px] px-6 md:px-10 py-s-9">
-          <div className="flex justify-end mb-s-4">
+          <div className="flex justify-between items-center mb-s-4">
+            <SidebarToggle />
             <ThemeToggle />
           </div>
           <div className="md:flex md:items-start md:gap-s-8">
-            <aside className="hidden md:block md:w-64 md:shrink-0 md:sticky md:top-s-9">
+            <SidebarShell>
               <Sidebar />
-            </aside>
+            </SidebarShell>
             <div className="min-w-0 flex-1">{children}</div>
           </div>
         </div>
