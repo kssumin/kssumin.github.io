@@ -24,6 +24,13 @@ function readPostFile(filename: string): Post {
   const raw = fs.readFileSync(fullPath, 'utf-8');
   const { data, content } = matter(raw);
 
+  if (!data.title || typeof data.title !== 'string') {
+    throw new Error(`Post ${filename} is missing a valid "title" in frontmatter`);
+  }
+  if (!data.date || typeof data.date !== 'string') {
+    throw new Error(`Post ${filename} is missing a valid "date" in frontmatter`);
+  }
+
   return {
     slug,
     title: data.title,
@@ -80,7 +87,10 @@ export function groupPostsBySeries(posts: PostMeta[]): SeriesGroup[] {
     result.push({ series: sorted[0].series, posts: sorted, latestDate });
   }
 
-  return result.sort((a, b) => (a.latestDate > b.latestDate ? -1 : 1));
+  return result.sort((a, b) => {
+    if (a.latestDate === b.latestDate) return 0;
+    return a.latestDate > b.latestDate ? -1 : 1;
+  });
 }
 
 export function getAdjacentPosts(

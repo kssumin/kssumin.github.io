@@ -31,6 +31,25 @@ describe('groupPostsBySeries', () => {
     expect(groups[0].series).toBe('NEW');
     expect(groups[1].series).toBe('OLD');
   });
+
+  it('시리즈 내 가장 최근 date가 배열 중간에 있어도 latestDate로 정확히 계산된다', () => {
+    const posts = [
+      post({ slug: 'p1', series: 'S', order: 1, date: '2026-01-01' }),
+      post({ slug: 'p2', series: 'S', order: 2, date: '2026-06-01' }),
+      post({ slug: 'p3', series: 'S', order: 3, date: '2026-03-01' }),
+    ];
+    const [group] = groupPostsBySeries(posts);
+    expect(group.latestDate).toBe('2026-06-01');
+  });
+
+  it('series가 null인 서로 다른 글은 각각 별도 그룹으로 취급한다', () => {
+    const posts = [
+      post({ slug: 'solo-a', series: null }),
+      post({ slug: 'solo-b', series: null }),
+    ];
+    const groups = groupPostsBySeries(posts);
+    expect(groups).toHaveLength(2);
+  });
 });
 
 describe('getAdjacentPosts', () => {
