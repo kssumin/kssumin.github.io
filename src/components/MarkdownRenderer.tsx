@@ -1,0 +1,27 @@
+import { unified } from 'unified';
+import remarkParse from 'remark-parse';
+import remarkGfm from 'remark-gfm';
+import remarkRehype from 'remark-rehype';
+import rehypePrettyCode from 'rehype-pretty-code';
+import rehypeReact from 'rehype-react';
+import * as prod from 'react/jsx-runtime';
+
+export async function MarkdownRenderer({ content }: { content: string }) {
+  const file = await unified()
+    .use(remarkParse)
+    .use(remarkGfm)
+    .use(remarkRehype)
+    .use(rehypePrettyCode, { theme: 'github-light' })
+    .use(rehypeReact, {
+      Fragment: prod.Fragment,
+      jsx: prod.jsx,
+      jsxs: prod.jsxs,
+    })
+    .process(content);
+
+  return (
+    <div className="max-w-none text-body [&_h2]:text-h2 [&_h2]:mt-s-7 [&_h2]:mb-s-4 [&_h3]:text-h3 [&_h3]:mt-s-6 [&_h3]:mb-s-3 [&_p]:mb-s-4 [&_pre]:rounded-md [&_pre]:p-s-4 [&_pre]:overflow-x-auto [&_pre]:my-s-5 [&_code]:text-code [&_ul]:list-disc [&_ul]:pl-s-5 [&_ol]:list-decimal [&_ol]:pl-s-5 [&_blockquote]:border-l-2 [&_blockquote]:border-ink-300 [&_blockquote]:pl-s-4 [&_blockquote]:text-ink-600 [&_table]:w-full [&_th]:text-left [&_th]:border-b [&_th]:border-ink-300 [&_th]:pb-s-2 [&_td]:border-b [&_td]:border-ink-100 [&_td]:py-s-2">
+      {file.result as React.ReactElement}
+    </div>
+  );
+}
