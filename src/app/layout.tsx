@@ -34,7 +34,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
         <script dangerouslySetInnerHTML={{ __html: noFlashScript }} />
       </head>
       <body>
-        <div className="mx-auto max-w-[1200px] px-6 md:px-10 py-s-9">
+        <div className="mx-auto max-w-[1560px] px-6 md:px-10 py-s-9">
           <div className="flex justify-between items-center mb-s-4">
             <SidebarToggle />
             <ThemeToggle />
