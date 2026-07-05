@@ -1,5 +1,6 @@
 import Link from 'next/link';
 import { getAllPosts, getPublishedPosts, groupPostsBySeries } from '@/lib/posts';
+import { mergeMiscGroups } from '@/lib/sidebarGroups';
 import { SidebarNav } from './SidebarNav';
 
 // Server component: reads published posts/series from the filesystem at
@@ -8,7 +9,7 @@ import { SidebarNav } from './SidebarNav';
 // one small client piece that needs the current pathname.
 export function Sidebar() {
   const posts = getPublishedPosts(getAllPosts());
-  const groups = groupPostsBySeries(posts);
+  const groups = mergeMiscGroups(groupPostsBySeries(posts));
 
   return (
     <div>
