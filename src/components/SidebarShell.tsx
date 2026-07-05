@@ -37,7 +37,7 @@ export function SidebarShell({ children }: { children: ReactNode }) {
 
   return (
     <aside
-      className="hidden md:block md:w-64 md:shrink-0 md:sticky md:top-s-9"
+      className="hidden md:block md:w-56 md:shrink-0 md:sticky md:top-s-9"
       style={style}
     >
       {children}
