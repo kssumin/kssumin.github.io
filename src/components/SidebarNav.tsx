@@ -54,15 +54,21 @@ export function SidebarNav({ groups }: { groups: SeriesGroup[] }) {
         const key = groupKey(group);
         const isExpanded = expanded.has(key);
 
+        const panelId = `sidebar-panel-${index}`;
+
         return (
           <div key={key} className={index === 0 ? '' : 'mt-s-6'}>
             <button
               type="button"
               onClick={() => toggle(key)}
               aria-expanded={isExpanded}
+              aria-controls={panelId}
               className="eyebrow mb-s-2 flex w-full items-center gap-1 text-left hover:text-blue-600 transition-colors"
             >
-              <span className={`inline-block transition-transform ${isExpanded ? 'rotate-90' : ''}`}>
+              <span
+                aria-hidden="true"
+                className={`inline-block transition-transform duration-200 ${isExpanded ? 'rotate-90' : ''}`}
+              >
                 ▸
               </span>
               {group.series}
@@ -72,7 +78,7 @@ export function SidebarNav({ groups }: { groups: SeriesGroup[] }) {
                 isExpanded ? 'grid-rows-[1fr]' : 'grid-rows-[0fr]'
               }`}
             >
-              <div className="overflow-hidden">
+              <div id={panelId} className="overflow-hidden" inert={!isExpanded}>
                 <ul>
                   {group.posts.map((post) => {
                     const href = `/posts/${post.slug}/`;
