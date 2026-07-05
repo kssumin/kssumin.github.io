@@ -1,6 +1,13 @@
 import Link from 'next/link';
 import { notFound } from 'next/navigation';
-import { getAllPosts, getAllCategories, getPostsByCategory, getPublishedPosts } from '@/lib/posts';
+import {
+  getAllPosts,
+  getAllCategories,
+  getPostsByCategory,
+  getPublishedPosts,
+  groupPostsBySeries,
+} from '@/lib/posts';
+import { SeriesHeader } from '@/components/SeriesHeader';
 import { PostRow } from '@/components/PostRow';
 
 export function generateStaticParams() {
@@ -27,11 +34,11 @@ export default async function CategoryPage({
   // defensively; decoding an already-decoded string is a no-op.
   const category = decodeURIComponent(rawCategory);
   const posts = getPublishedPosts(getAllPosts());
-  const matched = getPostsByCategory(posts, category).sort((a, b) =>
-    a.date > b.date ? -1 : a.date < b.date ? 1 : 0
-  );
+  const matched = getPostsByCategory(posts, category);
 
   if (matched.length === 0) notFound();
+
+  const groups = groupPostsBySeries(matched);
 
   return (
     <main className="max-w-reading">
@@ -41,11 +48,19 @@ export default async function CategoryPage({
       <h1 className="text-h1 mt-s-5 mb-s-2">{category}</h1>
       <p className="eyebrow mb-s-7">{matched.length} POSTS</p>
 
-      <div>
-        {matched.map((post) => (
-          <PostRow key={post.slug} post={post} showEpisode={false} />
-        ))}
-      </div>
+      {groups.map((group, index) => (
+        <section
+          key={group.series ?? group.posts[0].slug}
+          className={index === 0 ? '' : 'mt-s-9'}
+        >
+          <SeriesHeader series={group.series} count={group.posts.length} />
+          <div>
+            {group.posts.map((post) => (
+              <PostRow key={post.slug} post={post} />
+            ))}
+          </div>
+        </section>
+      ))}
     </main>
   );
 }
